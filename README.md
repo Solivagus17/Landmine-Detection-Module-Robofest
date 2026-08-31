@@ -10,7 +10,7 @@
 [![Status](https://img.shields.io/badge/Status-Competition%20Ready-brightgreen?style=for-the-badge)]()
 
 > **Real-time landmine & buried-mine-marker detection** for an autonomous aerial drone using RGB camera only.  
-> Optimized for CPU-only inference on Raspberry Pi 5, achieving **20–50 ms/frame** with the classical pipeline.
+> Optimized for CPU-only inference on Raspberry Pi , achieving **20–50 ms/frame** with the classical pipeline.
 
 </div>
 
