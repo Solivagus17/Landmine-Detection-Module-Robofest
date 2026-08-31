@@ -1,0 +1,302 @@
+# =============================================================================
+# Landmine Detection Module — Configuration
+# Robofest Gujarat 6.0 | Aerial Robotics | Senior Category
+# =============================================================================
+# This file is the SINGLE SOURCE OF TRUTH for all tunable parameters.
+# Edit this file at the venue to adapt to actual mine/marker appearance.
+# No code changes required for threshold tuning.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# CAMERA / INPUT SOURCE
+# -----------------------------------------------------------------------------
+camera:
+  # Source: integer (webcam index), file path (video/image), or RTSP URL string.
+  # Examples:
+  #   source: 0                          # Default webcam
+  #   source: "test_footage.mp4"         # Video file
+  #   source: "rtsp://192.168.1.10/stream" # Drone RTSP stream
+  source: 0
+
+  # Working resolution (width x height) — all detection runs at this size.
+  # Lower = faster on Pi 5. Recommended: 480 for laptop dev, 320 for Pi 5 deploy.
+  working_width: 480
+  working_height: 480
+
+  # Target FPS cap (0 = uncapped, run as fast as possible)
+  target_fps: 0
+
+
+# -----------------------------------------------------------------------------
+# PREPROCESSING
+# -----------------------------------------------------------------------------
+preprocessing:
+  # Apply CLAHE (Contrast Limited Adaptive Histogram Equalization) to the
+  # grayscale channel before edge detection. Helps on overcast / shadowed terrain.
+  use_clahe: true
+  clahe_clip_limit: 2.0
+  clahe_tile_size: 8          # Grid size (NxN tiles)
+
+  # Gaussian blur before edge detection — reduces sensor noise.
+  # Set kernel_size to 0 to disable.
+  blur_kernel_size: 3         # Must be odd: 3, 5, 7 ...
+  blur_sigma: 0               # 0 = auto from kernel size
+
+
+# -----------------------------------------------------------------------------
+# CANDIDATE PROPOSAL — EDGE / GRADIENT METHOD (PRIMARY)
+# -----------------------------------------------------------------------------
+candidate_proposal:
+  # Method: "canny" | "adaptive_thresh" | "both"
+  # "both" runs both methods and merges results — recommended for robustness.
+  method: "both"
+
+  # --- Canny edge detector ---
+  # NOTE: On random-noise synthetic frames these will fire heavily — that is
+  # expected. On real outdoor terrain (lower spatial frequency), these defaults
+  # produce far fewer candidates. Raise canny_low/high if still too many FPs.
+  canny_low: 50
+  canny_high: 130
+  # Dilation after Canny to close edge gaps around mine boundary.
+  canny_dilation_kernel: 5    # px, square kernel
+  canny_dilation_iters: 2
+
+  # --- Adaptive thresholding ---
+  # Finds flat uniform blobs that Canny misses (low-contrast mine on similar ground).
+  adaptive_block_size: 51     # Must be odd, > 1. Larger = coarser local window.
+  adaptive_c: 8               # Subtracted constant. Higher = less sensitive.
+
+  # --- Deduplication (when method = "both") ---
+  # Minimum IoU overlap to consider two contours from different methods as duplicates.
+  dedup_iou_threshold: 0.3
+
+
+# -----------------------------------------------------------------------------
+# SURFACE MINE — SHAPE FILTER
+# -----------------------------------------------------------------------------
+# These are the PRIMARY knobs to tune per flight altitude.
+#
+# ALTITUDE → PIXEL SIZE FORMULA (for a 480px-wide frame):
+#   mine_diameter_px ≈ (mine_real_diameter_m / flight_altitude_m) * focal_length_px
+#   For a typical wide-angle drone camera (FOV ~90°), focal_length_px ≈ working_width / 2
+#
+# Quick lookup (working_width=480, FOV~90°, mine=0.25m):
+#   Altitude 0.5 m  → mine ≈ 120 px → area ≈ 11000 px²
+#   Altitude 1.0 m  → mine ≈  60 px → area ≈  2800 px²
+#   Altitude 2.0 m  → mine ≈  30 px → area ≈   700 px²
+#   Altitude 3.0 m  → mine ≈  20 px → area ≈   310 px²
+#   Altitude 4.0 m  → mine ≈  15 px → area ≈   175 px²
+#
+# Set min/max to cover your expected altitude range with headroom.
+surface_mine:
+  # Size range for mine candidates (px² at working resolution).
+  #
+  # Altitude → pixel area quick reference (480px wide, ~90° FOV):
+  #   0.5 m → mine ≈ 11000 px²   1.0 m → ≈ 2800 px²
+  #   2.0 m → mine ≈  700 px²    3.0 m → ≈  310 px²   4.0 m → ≈ 175 px²
+  #
+  # Set min_area_px to cover slightly below your lowest expected altitude.
+  # Raising it aggressively eliminates small-object FPs (guitar pegs,
+  # tile joints, shadows) at the cost of missing mines at very high altitude.
+  min_area_px: 400            # px² — raised from 150 to kill small-object FPs
+  max_area_px: 20000          # px²
+
+  # Aspect ratio of bounding rectangle: width / height.
+  # Disc / ellipse — not very elongated.
+  min_aspect_ratio: 0.40
+  max_aspect_ratio: 2.50
+
+  # Solidity: contour_area / convex_hull_area.
+  # High for a filled disc; low for a hand (finger gaps reduce fill).
+  min_solidity: 0.65
+
+  # Circularity = 4π·area/perimeter²
+  # Perfect circle = 1.0 | Ellipse (2:1) ≈ 0.78 | Hand/jagged blob ≈ 0.05-0.25
+  min_circularity: 0.50
+
+  # Polygon approximation vertex count gate — RECTANGLE REJECTION.
+  # cv2.approxPolyDP with epsilon = approx_epsilon_frac × perimeter.
+  #
+  #   Shape             Approx vertices (epsilon=2%)
+  #   ─────────────────────────────────────────────
+  #   Rectangle/frame   4          ← REJECTED
+  #   Pentagon/diamond  5          ← REJECTED
+  #   Hexagon           6          ← REJECTED
+  #   Ellipse (any AR)  8-15       ← ACCEPTED
+  #   Circle            10-20      ← ACCEPTED
+  #
+  # min_approx_vertices: 7 cleanly separates polygons from smooth curves.
+  # Raise approx_epsilon_frac (e.g. 0.03) if noisy mine contours give too few.
+  min_approx_vertices: 7
+  approx_epsilon_frac: 0.02
+
+  # ── NEW: organic-object rejection filters ─────────────────────────────────
+
+  # Convexity defect gate (pixels at working resolution).
+  # Measures the depth of the deepest concavity in the contour's convex hull.
+  # A smooth disc: near 0 px. Finger gaps in a hand: 10-40 px.
+  # Lower = stricter (fewer FPs, but may miss partially-occluded mines).
+  # Raise to 20-25 if mine edges at low altitude produce shallow defects.
+  max_convexity_defect_px: 10.0
+
+  # Texture uniformity gate.
+  # Std dev of grayscale pixel values INSIDE the contour mask.
+  #
+  # Reference values at 480px working resolution:
+  #   Flat matte plastic disc (actual mine): 5-25     ← ideal target
+  #   Shiny/reflective steel plate (indoor proxy): 35-65 (specular highlight+shadow)
+  #   Human skin / hand: 30-55
+  #   Carpet / fabric: 40-70
+  #
+  # For indoor laptop testing with reflective steel plates as mine proxies:
+  #   Set to 65-70 so plates are detected.
+  # For actual competition (non-reflective matte plastic mines):
+  #   Lower back to 30-35 to reject skin/fabric FPs more aggressively.
+  max_texture_std: 65.0
+
+  # Color consistency gate.
+  # Mean of per-channel BGR std deviations inside the contour mask.
+  # Same tuning logic as max_texture_std — raise for reflective proxies,
+  # lower for matte plastic mines at the venue.
+  max_color_std: 70.0
+
+  # ──────────────────────────────────────────────────────────────────────────
+
+  # Extent: contour_area / bounding_rect_area. Optional additional filter.
+  # 0 = disabled. Enable (e.g., 0.20) if too many elongated false positives.
+  min_extent: 0.0
+
+  # Heuristic confidence: base score assigned to candidates passing all filters.
+  # Final confidence = base + bonuses from solidity, size match, etc.
+  base_confidence: 0.50
+
+
+# -----------------------------------------------------------------------------
+# BURIED MINE MARKER — SHAPE FILTER
+# -----------------------------------------------------------------------------
+# IMPORTANT: Marker design is UNKNOWN until race day.
+# At the venue, use utils/color_picker.py to extract HSV range from a real marker sample,
+# then fill in marker_color_hsv below and set use_color_gate: true.
+#
+# Current strategy: detect any small anomalous candidate separate from mine-size range,
+# classify as buried_marker if it passes marker-specific shape and (optionally) color gates.
+buried_marker:
+  # Set to false to completely disable buried marker detection.
+  # Re-enable once the real marker design is known at the venue.
+  enabled: false
+
+  # Size range for the marker (typically smaller than a mine disc).
+  min_area_px: 30             # px²
+  max_area_px: 3000           # px²
+
+  min_aspect_ratio: 0.15
+  max_aspect_ratio: 6.0       # Permissive — peg/ring/patch all differ
+
+  # Circularity gate for markers (looser than mine — marker may be a peg or ring)
+  min_circularity: 0.25
+
+  min_solidity: 0.30          # Lower than mine — markers can be very irregular
+
+  # --- Optional color gate (OFF by default, enable at venue once marker is known) ---
+  use_color_gate: false
+  # HSV bounds [H_low, S_low, V_low], [H_high, S_high, V_high]
+  # Hue range: 0–179 in OpenCV. Saturation/Value: 0–255.
+  # Use utils/color_picker.py to extract these from a real marker sample.
+  marker_color_hsv_low:  [0,   100, 80]
+  marker_color_hsv_high: [10,  255, 255]
+  # For colors that wrap around hue 0 (red), set use_hue_wrap: true
+  # and provide a second range in marker_color_hsv_low2 / high2.
+  use_hue_wrap: false
+  marker_color_hsv_low2:  [170, 100, 80]
+  marker_color_hsv_high2: [179, 255, 255]
+
+  # Minimum fraction of candidate interior pixels that must match color gate
+  # (only used when use_color_gate: true).
+  color_gate_min_fill: 0.30
+
+  base_confidence: 0.40
+
+
+# -----------------------------------------------------------------------------
+# PATCH CLASSIFIER (OPTIONAL — stub for future CNN upgrade)
+# -----------------------------------------------------------------------------
+patch_classifier:
+  # Set to true once you have a trained patch classifier model (.onnx or .tflite).
+  enabled: false
+  model_path: "models/patch_classifier.onnx"
+  input_size: 64              # px, square input to the classifier
+  # Threshold: patch_score >= this → confirmed detection
+  score_threshold: 0.55
+
+
+# -----------------------------------------------------------------------------
+# YOLO DETECTOR (FUTURE UPGRADE SLOT)
+# -----------------------------------------------------------------------------
+yolo:
+  # Flip this to "yolo" once you have a trained model to use YOLO instead of classical.
+  # All other modules remain unchanged.
+  enabled: false
+  model_path: "models/mine_detector.pt"   # or .ncnn for Pi 5
+  input_size: 320             # px, YOLO inference resolution
+  confidence_threshold: 0.40
+  iou_threshold: 0.45         # NMS IoU threshold
+  class_names:
+    - "surface_mine"
+    - "buried_marker"
+
+
+# -----------------------------------------------------------------------------
+# ACTIVE DETECTOR BACKEND
+# -----------------------------------------------------------------------------
+# "classical"  → uses candidate_proposal + shape_filter (default, no dataset needed)
+# "yolo"       → uses YOLO inference (requires trained model + yolo.enabled: true)
+# "hybrid"     → runs both, merges results (for future combination mode)
+detector_backend: "classical"
+
+
+# -----------------------------------------------------------------------------
+# OUTPUT / RESULT FORMAT
+# -----------------------------------------------------------------------------
+output:
+  # Whether to emit detection results as JSON to stdout (for mapping module to consume).
+  # Each frame outputs one JSON line: {"frame_id": N, "detections": [...]}
+  emit_json: false
+
+  # Write detection JSON to a file (empty string = disabled).
+  json_output_file: ""
+
+  # Minimum confidence to include a detection in output (hard gate).
+  confidence_threshold: 0.35
+
+
+# -----------------------------------------------------------------------------
+# DEBUG VISUALIZATION
+# -----------------------------------------------------------------------------
+debug:
+  # Master switch — set false for headless/deployment mode.
+  enabled: true
+
+  # Draw filled semi-transparent contour overlay (instead of just bbox).
+  draw_contour_fill: true
+  contour_fill_alpha: 0.25
+
+  # Draw bounding boxes in addition to contours.
+  draw_bbox: true
+
+  # Show FPS counter overlay.
+  show_fps: true
+
+  # Show detector backend name overlay.
+  show_backend_label: true
+
+  # Colors (BGR format for OpenCV):
+  color_surface_mine:   [50, 220, 50]    # Green
+  color_buried_marker:  [220, 120, 50]   # Blue-ish teal
+  color_unknown:        [200, 200, 200]  # Grey fallback
+
+  # Fraction of screen to use for the debug window (0.0-1.0).
+  # 0.95 = 95% of screen width/height. Set to 1.0 for true fullscreen.
+  display_screen_fraction: 0.95
+
+  # Window title
+  window_title: "Landmine Detection - Debug View"
