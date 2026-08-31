@@ -1,26 +1,29 @@
 """
 detection/classical/shape_filter.py
 ────────────────────────────────────
-Shape-based filtering and classification of raw candidate contours.
+9-Stage Geometric, Topological, and Photometric Shape Filtering Engine.
 
-Given the raw contour list from CandidateProposer, this module applies a
-layered rejection pipeline specifically tuned to discriminate mine discs from
-organic/scene false positives (hands, skin, fabric, shadows, floor patterns).
+Robofest Gujarat 6.0 | Aerial Robotics | Senior Division
 
-Filter pipeline (in order of cheapness, applied early-to-late):
-  1.  Area gate               — size range for mine vs scene objects
-  2.  Aspect ratio gate       — disc is not very elongated
-  3.  Circularity gate        — roundness: disc ≈ 0.7-1.0, jagged blob ≈ 0.05-0.3
-  4.  Solidity gate           — area / convex_hull (hand gaps → low solidity)
-  5.  Convexity defect gate   — max depth of hull concavities in px
-                                (finger gaps create deep defects; disc has none)
-  6.  Texture uniformity gate — std dev of grayscale pixels inside contour
-                                (flat plastic = low; skin/fabric = high)
-  7.  Color consistency gate  — std dev of pixel values: mine is one solid color
-  8.  Confidence scoring      — heuristic blend of shape quality metrics
+Evaluates raw candidate contours produced by CandidateProposer against a sequential
+hierarchy of discriminative gates engineered to differentiate planar landmine discs
+and tactical subsurface markers from scene clutter (floor tiles, wires, human hands,
+fabric, gravel, and organic ground shadows):
 
-Key design choice: compute ALL metrics in the filter() loop from the grayscale
-frame, then pass them into evaluators. Evaluators are pure logic, not I/O.
+Sequential Filter Pipeline (Ordered by Computational Complexity):
+  1. Area Range Gate: Bounded by metric flight altitude projection table [min_area_px, max_area_px].
+  2. Bounding-Box Aspect Ratio Gate: Rejects elongated linear artifacts (wires, ruts, cracks).
+  3. Circularity / Isoperimetric Quotient Gate: Q = (4 * pi * Area) / Perimeter^2 >= 0.50.
+  4. Convex Hull Solidity Gate: S = Area / Hull_Area >= 0.65.
+  5. Polygonal Vertex Count Gate (RDP Rectangle Rejection): N_v >= 7 (approx_epsilon_frac=0.02).
+  6. Maximum Convexity Defect Depth Gate: Scans boundary concavity depth (D_max <= 10.0 px).
+  7. Interior Grayscale Texture Dispersion Gate: Masked pixel std dev (sigma_gray <= 65.0).
+  8. Interior BGR Color Dispersion Gate: Mean per-channel standard deviation (sigma_BGR <= 70.0).
+  9. Heuristic Confidence Fusion: Blends circularity, solidity, and photometric uniformity metrics.
+
+Buried Marker Perception:
+  Evaluated through dedicated geometric gates and optional race-day calibrated HSV color manifold
+  boundaries with full hue wrap-around support for red pigments ([0, 10] U [170, 179]).
 
 Author: Robofest 6.0 — Landmine Detection Team
 """
@@ -39,14 +42,15 @@ from output.detection_result import Detection, MineClass
 logger = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------------------------
-# Intermediate candidate (internal, before confidence scoring)
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# Internal Candidate Representation
+# ===========================================================================
 
-@dataclass
+@dataclass(frozen=True)
 class _Candidate:
+    """Internal candidate structure prior to final Detection contract generation."""
     contour:       np.ndarray
-    bbox:          Tuple[int, int, int, int]   # (x, y, w, h)
+    bbox:          Tuple[int, int, int, int]   # (x, y, w, h) in working resolution
     area:          float
     solidity:      float
     aspect_ratio:  float
@@ -54,94 +58,75 @@ class _Candidate:
     confidence:    float
 
 
-# ---------------------------------------------------------------------------
-# ShapeFilter
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# Shape Filter Engine
+# ===========================================================================
 
 class ShapeFilter:
     """
-    Filters and classifies candidate contours from CandidateProposer.
+    Stateful geometry and texture classification engine.
 
     Parameters
     ----------
     mine_cfg : dict
-        The `surface_mine` section of config.yaml.
+        The `surface_mine` section from config.yaml.
     marker_cfg : dict
-        The `buried_marker` section of config.yaml.
+        The `buried_marker` section from config.yaml.
     """
 
-    def __init__(self, mine_cfg: dict, marker_cfg: dict):
-        # --- Surface mine parameters ---
-        self._mine_min_area   = float(mine_cfg.get("min_area_px",         150))
-        self._mine_max_area   = float(mine_cfg.get("max_area_px",       20000))
-        self._mine_min_ar     = float(mine_cfg.get("min_aspect_ratio",    0.40))
-        self._mine_max_ar     = float(mine_cfg.get("max_aspect_ratio",    2.50))
-        self._mine_min_sol    = float(mine_cfg.get("min_solidity",         0.65))
-        self._mine_min_ext    = float(mine_cfg.get("min_extent",           0.0))
+    def __init__(self, mine_cfg: dict, marker_cfg: dict) -> None:
+        # --- Surface Mine Filter Parameters ---
+        self._mine_min_area: float = float(mine_cfg.get("min_area_px", 400.0))
+        self._mine_max_area: float = float(mine_cfg.get("max_area_px", 20000.0))
+        self._mine_min_ar: float = float(mine_cfg.get("min_aspect_ratio", 0.40))
+        self._mine_max_ar: float = float(mine_cfg.get("max_aspect_ratio", 2.50))
+        self._mine_min_sol: float = float(mine_cfg.get("min_solidity", 0.65))
+        self._mine_min_ext: float = float(mine_cfg.get("min_extent", 0.0))
 
-        # Circularity = 4π·area/perimeter²  (perfect circle = 1.0)
-        # Ellipse 2:1 ≈ 0.78 | jagged hand blob ≈ 0.05-0.25
-        self._mine_min_circ   = float(mine_cfg.get("min_circularity",     0.50))
+        # Circularity (Isoperimetric Quotient: 4*pi*Area / Perimeter^2)
+        self._mine_min_circ: float = float(mine_cfg.get("min_circularity", 0.50))
 
-        # Polygon approximation vertex count gate.
-        # cv2.approxPolyDP simplifies the contour with epsilon=2% of perimeter.
-        # Rectangle / painting / frame  → ~4 vertices   (REJECTED)
-        # Triangle, diamond             → 3-5 vertices  (REJECTED)
-        # Ellipse / disc                → 8-15 vertices (ACCEPTED)
-        # Raise epsilon_frac in config to get fewer vertices from noisy contours.
-        self._mine_min_verts  = int(mine_cfg.get("min_approx_vertices",   7))
-        self._mine_eps_frac   = float(mine_cfg.get("approx_epsilon_frac", 0.02))
+        # Ramer-Douglas-Peucker (RDP) Polygon Simplification Vertex Gate
+        self._mine_min_verts: int = int(mine_cfg.get("min_approx_vertices", 7))
+        self._mine_eps_frac: float = float(mine_cfg.get("approx_epsilon_frac", 0.02))
 
-        # Convexity defect gate:
-        # Depth of deepest concavity in the contour's convex hull (pixels).
-        # A disc has near-zero defect depth; finger gaps create 10-40px defects.
-        # Unit: pixels at working resolution (e.g. 480px wide).
-        self._mine_max_defect = float(mine_cfg.get("max_convexity_defect_px", 10.0))
+        # Convexity Defect Depth Gate (pixels at working canvas resolution)
+        self._mine_max_defect: float = float(mine_cfg.get("max_convexity_defect_px", 10.0))
 
-        # Texture uniformity gate:
-        # Std dev of grayscale pixel values INSIDE the contour mask.
-        # Flat plastic disc: 5-25 (very uniform tone).
-        # Human skin / fabric: 30-70 (texture, creases, shadows).
-        self._mine_max_tex    = float(mine_cfg.get("max_texture_std",     32.0))
+        # Interior Grayscale and Color Variance Limits
+        self._mine_max_tex: float = float(mine_cfg.get("max_texture_std", 65.0))
+        self._mine_max_color: float = float(mine_cfg.get("max_color_std", 70.0))
+        self._mine_base_conf: float = float(mine_cfg.get("base_confidence", 0.50))
 
-        # Color consistency gate:
-        # Std dev of BGR channel values inside the contour mask, averaged
-        # across channels. One-solid-color mine: low; multi-tone skin: high.
-        # Set to 0 to disable (same info as texture_std for greyscale).
-        self._mine_max_color  = float(mine_cfg.get("max_color_std",       40.0))
+        # --- Buried Marker Filter Parameters ---
+        self._mrk_enabled: bool = bool(marker_cfg.get("enabled", False))
+        self._mrk_min_area: float = float(marker_cfg.get("min_area_px", 30.0))
+        self._mrk_max_area: float = float(marker_cfg.get("max_area_px", 3000.0))
+        self._mrk_min_ar: float = float(marker_cfg.get("min_aspect_ratio", 0.15))
+        self._mrk_max_ar: float = float(marker_cfg.get("max_aspect_ratio", 6.0))
+        self._mrk_min_sol: float = float(marker_cfg.get("min_solidity", 0.30))
+        self._mrk_min_circ: float = float(marker_cfg.get("min_circularity", 0.25))
+        self._mrk_base_conf: float = float(marker_cfg.get("base_confidence", 0.40))
 
-        self._mine_base_conf  = float(mine_cfg.get("base_confidence",      0.50))
-
-        # --- Buried marker parameters ---
-        self._mrk_enabled     = bool(marker_cfg.get("enabled", True))
-        self._mrk_min_area    = float(marker_cfg.get("min_area_px",         30))
-        self._mrk_max_area    = float(marker_cfg.get("max_area_px",       3000))
-        self._mrk_min_ar      = float(marker_cfg.get("min_aspect_ratio",   0.15))
-        self._mrk_max_ar      = float(marker_cfg.get("max_aspect_ratio",   6.0))
-        self._mrk_min_sol     = float(marker_cfg.get("min_solidity",        0.30))
-        self._mrk_min_circ    = float(marker_cfg.get("min_circularity",    0.25))
-        self._mrk_base_conf   = float(marker_cfg.get("base_confidence",    0.40))
-
-        # --- Marker color gate ---
-        self._color_gate_on   = bool(marker_cfg.get("use_color_gate", False))
-        self._color_low1  = np.array(marker_cfg.get("marker_color_hsv_low",  [0,   100, 80]),  dtype=np.uint8)
-        self._color_high1 = np.array(marker_cfg.get("marker_color_hsv_high", [10,  255, 255]), dtype=np.uint8)
-        self._use_hue_wrap    = bool(marker_cfg.get("use_hue_wrap", False))
-        self._color_low2  = np.array(marker_cfg.get("marker_color_hsv_low2",  [170, 100, 80]),  dtype=np.uint8)
-        self._color_high2 = np.array(marker_cfg.get("marker_color_hsv_high2", [179, 255, 255]), dtype=np.uint8)
-        self._color_min_fill  = float(marker_cfg.get("color_gate_min_fill", 0.30))
+        # --- Race-Day Marker HSV Color Manifold Gating ---
+        self._color_gate_on: bool = bool(marker_cfg.get("use_color_gate", False))
+        self._color_low1: np.ndarray = np.array(marker_cfg.get("marker_color_hsv_low", [0, 100, 80]), dtype=np.uint8)
+        self._color_high1: np.ndarray = np.array(marker_cfg.get("marker_color_hsv_high", [10, 255, 255]), dtype=np.uint8)
+        self._use_hue_wrap: bool = bool(marker_cfg.get("use_hue_wrap", False))
+        self._color_low2: np.ndarray = np.array(marker_cfg.get("marker_color_hsv_low2", [170, 100, 80]), dtype=np.uint8)
+        self._color_high2: np.ndarray = np.array(marker_cfg.get("marker_color_hsv_high2", [179, 255, 255]), dtype=np.uint8)
+        self._color_min_fill: float = float(marker_cfg.get("color_gate_min_fill", 0.30))
 
         logger.info(
-            "ShapeFilter ready — mine area: [%.0f, %.0f] px², circ≥%.2f, "
-            "tex_std≤%.0f, defect≤%.0fpx | marker: %s",
+            "ShapeFilter initialized (mine_area=[%.0f, %.0f], circ>=%.2f, tex_std<=%.0f, defect<=%.1fpx | marker=%s)",
             self._mine_min_area, self._mine_max_area,
             self._mine_min_circ, self._mine_max_tex, self._mine_max_defect,
             "ENABLED" if self._mrk_enabled else "DISABLED",
         )
 
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
+    # -----------------------------------------------------------------------
+    # Public Filtering Method
+    # -----------------------------------------------------------------------
 
     def filter(
         self,
@@ -152,30 +137,28 @@ class ShapeFilter:
         detector_backend: str = "classical",
     ) -> List[Detection]:
         """
-        Filter raw candidate contours and produce Detection objects.
+        Evaluate raw contour populations against geometric, topological, and photometric discriminators.
 
         Parameters
         ----------
         contours : list of np.ndarray
-            Raw contours from CandidateProposer.propose().
+            Raw topological contours from CandidateProposer.propose().
         frame : np.ndarray
-            Preprocessed BGR frame — used for texture/color analysis.
+            Preprocessed BGR working frame used for interior pixel extraction.
         frame_id : int
-            Current frame counter (passed through to Detection).
+            Monotonically increasing integer frame counter.
         timestamp_ms : float
-            Wall-clock time of frame capture in ms.
-        detector_backend : str
-            Backend label passed through to Detection.
+            Capture epoch timestamp in milliseconds.
+        detector_backend : str, default="classical"
+            Backend provenance tag.
 
         Returns
         -------
         List[Detection]
-            Confirmed detections, sorted by confidence descending.
+            Confirmed detection records, sorted by confidence score in descending order.
         """
-        # Pre-compute grayscale once — reused for texture analysis per contour
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-
-        # Pre-compute HSV frame once (only needed if color gate is on)
+        # Pre-compute color representations once per frame
+        gray: np.ndarray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         hsv_frame: Optional[np.ndarray] = None
         if self._color_gate_on:
             hsv_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
@@ -184,60 +167,57 @@ class ShapeFilter:
         detections: List[Detection] = []
 
         for contour in contours:
-            area = cv2.contourArea(contour)
-            if area < 1:
-                continue   # degenerate contour
+            area: float = cv2.contourArea(contour)
+            if area < 1.0:
+                continue
 
-            # ----------------------------------------------------------
-            # Step 1 — area gate
-            # ----------------------------------------------------------
-            is_mine_size   = self._mine_min_area <= area <= self._mine_max_area
-            is_marker_size = self._mrk_min_area  <= area <= self._mrk_max_area
+            # ---------------------------------------------------------------
+            # Stage 1: Area Boundary Gate
+            # ---------------------------------------------------------------
+            is_mine_size: bool = self._mine_min_area <= area <= self._mine_max_area
+            is_marker_size: bool = self._mrk_min_area <= area <= self._mrk_max_area
 
             if not is_mine_size and not is_marker_size:
                 continue
 
-            # ----------------------------------------------------------
-            # Step 2 — cheap geometric metrics (no pixel access yet)
-            # ----------------------------------------------------------
-            bbox         = cv2.boundingRect(contour)   # (x, y, w, h)
+            # ---------------------------------------------------------------
+            # Stage 2: Geometric & Topological Metrics (Pure Mathematics)
+            # ---------------------------------------------------------------
+            bbox: Tuple[int, int, int, int] = cv2.boundingRect(contour)
             bx, by, bw, bh = bbox
-            aspect_ratio = bw / bh if bh > 0 else 0.0
+            aspect_ratio: float = bw / bh if bh > 0 else 0.0
 
-            hull      = cv2.convexHull(contour)
-            hull_area = cv2.contourArea(hull)
-            solidity  = area / hull_area if hull_area > 0 else 0.0
+            hull: np.ndarray = cv2.convexHull(contour)
+            hull_area: float = cv2.contourArea(hull)
+            solidity: float = area / hull_area if hull_area > 0 else 0.0
+            extent: float = area / (bw * bh) if (bw * bh) > 0 else 0.0
 
-            extent = area / (bw * bh) if (bw * bh) > 0 else 0.0
+            # Isoperimetric Quotient / Circularity: 4*pi*Area / Perimeter^2
+            perimeter: float = cv2.arcLength(contour, closed=True)
+            circularity: float = (
+                (4.0 * 3.141592653589793 * area / (perimeter * perimeter))
+                if perimeter > 0 else 0.0
+            )
 
-            # Circularity = 4π·area/perimeter²
-            perimeter   = cv2.arcLength(contour, closed=True)
-            circularity = (4.0 * 3.14159265 * area / (perimeter * perimeter)
-                          ) if perimeter > 0 else 0.0
+            # RDP Polygon Simplification (Rectangle / Frame Rejection)
+            epsilon: float = self._mine_eps_frac * perimeter
+            approx: np.ndarray = cv2.approxPolyDP(contour, epsilon, closed=True)
+            n_verts: int = len(approx)
 
-            # Polygon vertex count — RECTANGLE REJECTION
-            # approxPolyDP with epsilon=2% of perimeter.
-            # Rectangle → 4 vertices | Circle/ellipse → 8-15 vertices.
-            epsilon = self._mine_eps_frac * perimeter
-            approx  = cv2.approxPolyDP(contour, epsilon, closed=True)
-            n_verts = len(approx)
-
-            # ----------------------------------------------------------
-            # Step 3 — pixel-level metrics (only if cheap gates passed)
-            # ----------------------------------------------------------
-            # Guard: skip pixel analysis early if geometric gates already fail
-            # (avoids wasting time on doomed candidates)
-            geom_ok_mine = (
+            # ---------------------------------------------------------------
+            # Stage 3: Photometric & Defect Metrics (Guarded Execution)
+            # ---------------------------------------------------------------
+            geom_ok_mine: bool = (
                 is_mine_size
-                and n_verts >= self._mine_min_verts          # not a rectangle/polygon
+                and n_verts >= self._mine_min_verts
                 and circularity >= self._mine_min_circ
                 and self._mine_min_ar <= aspect_ratio <= self._mine_max_ar
                 and solidity >= self._mine_min_sol
             )
 
-            texture_std    = 999.0   # high default → rejected unless computed
-            max_defect_px  = 999.0
-            color_std      = 999.0
+            texture_std: float = 999.0
+            color_std: float = 999.0
+            max_defect_px: float = 999.0
 
             if geom_ok_mine:
                 texture_std, color_std = self._compute_pixel_stats(
@@ -245,10 +225,10 @@ class ShapeFilter:
                 )
                 max_defect_px = self._compute_max_defect(contour)
 
-            # ----------------------------------------------------------
-            # Step 4 — classify as mine or marker
-            # ----------------------------------------------------------
-            candidate = None
+            # ---------------------------------------------------------------
+            # Stage 4: Target Classification
+            # ---------------------------------------------------------------
+            candidate: Optional[_Candidate] = None
 
             if is_mine_size:
                 candidate = self._evaluate_mine(
@@ -265,9 +245,9 @@ class ShapeFilter:
             if candidate is None:
                 continue
 
-            # ----------------------------------------------------------
-            # Step 5 — produce Detection
-            # ----------------------------------------------------------
+            # ---------------------------------------------------------------
+            # Stage 5: Detection Contract Instantiation
+            # ---------------------------------------------------------------
             detections.append(Detection(
                 class_name       = candidate.class_name,
                 bbox             = candidate.bbox,
@@ -278,27 +258,30 @@ class ShapeFilter:
                 detector_backend = detector_backend,
             ))
 
-        # Sort by confidence descending
+        # Sort detections by confidence descending
         detections.sort(key=lambda d: d.confidence, reverse=True)
 
         logger.debug(
-            "ShapeFilter: %d contours → %d detections (%d mines, %d markers)",
-            len(contours),
-            len(detections),
+            "ShapeFilter: %d contours -> %d detections (%d mines, %d markers)",
+            len(contours), len(detections),
             sum(1 for d in detections if d.class_name == MineClass.SURFACE_MINE),
             sum(1 for d in detections if d.class_name == MineClass.BURIED_MARKER),
         )
 
         return detections
 
-    # ------------------------------------------------------------------
-    # Internal classifiers
-    # ------------------------------------------------------------------
+    # -----------------------------------------------------------------------
+    # Internal Discriminator Classifiers
+    # -----------------------------------------------------------------------
 
     def _evaluate_mine(
         self,
-        contour, bbox, area: float,
-        solidity: float, aspect_ratio: float, extent: float,
+        contour: np.ndarray,
+        bbox: Tuple[int, int, int, int],
+        area: float,
+        solidity: float,
+        aspect_ratio: float,
+        extent: float,
         circularity: float,
         n_verts: int,
         texture_std: float,
@@ -306,49 +289,45 @@ class ShapeFilter:
         max_defect_px: float,
     ) -> Optional[_Candidate]:
         """
-        Apply all surface_mine filters.
-
-        Filter order: cheapest (geometry) first, most expensive (pixel) last.
+        Evaluate surface landmine discriminators and compute heuristic confidence.
         """
-
-        # 1. VERTEX COUNT — reject rectangles, frames, paintings, screens
-        # A circle/ellipse needs 8-15 poly segments; a rectangle needs only 4.
+        # Gate 1: RDP Vertex Count Gate (Rejects 4-vertex quadrilaterals / floor tiles)
         if n_verts < self._mine_min_verts:
             return None
 
-        # 2. CIRCULARITY — disc roundness
+        # Gate 2: Circularity Gate
         if circularity < self._mine_min_circ:
             return None
 
-        # 3. ASPECT RATIO — disc is not very elongated
+        # Gate 3: Aspect Ratio Bounding
         if not (self._mine_min_ar <= aspect_ratio <= self._mine_max_ar):
             return None
 
-        # 4. SOLIDITY — hand gaps / concave shapes rejected
+        # Gate 4: Convex Hull Solidity
         if solidity < self._mine_min_sol:
             return None
 
-        # 5. CONVEXITY DEFECTS — finger / finger-gap depth
+        # Gate 5: Convexity Defect Maximum Depth Gate (Rejects finger notches)
         if max_defect_px > self._mine_max_defect:
             return None
 
-        # 6. TEXTURE UNIFORMITY
+        # Gate 6: Grayscale Interior Texture Standard Deviation
         if texture_std > self._mine_max_tex:
             return None
 
-        # 7. COLOR CONSISTENCY
+        # Gate 7: BGR Color Dispersion
         if self._mine_max_color > 0 and color_std > self._mine_max_color:
             return None
 
-        # Optional extent gate
+        # Gate 8: Optional Extent Bounding
         if self._mine_min_ext > 0 and extent < self._mine_min_ext:
             return None
 
-        # Heuristic confidence
-        circ_bonus = max(0.0, (circularity - self._mine_min_circ) * 0.20)
-        sol_bonus  = max(0.0, (solidity    - self._mine_min_sol)  * 0.10)
-        tex_bonus  = max(0.0, (self._mine_max_tex - texture_std)  / self._mine_max_tex * 0.10)
-        confidence = min(1.0, self._mine_base_conf + circ_bonus + sol_bonus + tex_bonus)
+        # Stage 9: Heuristic Confidence Fusion
+        circ_bonus: float = max(0.0, (circularity - self._mine_min_circ) * 0.20)
+        sol_bonus: float = max(0.0, (solidity - self._mine_min_sol) * 0.10)
+        tex_bonus: float = max(0.0, (self._mine_max_tex - texture_std) / self._mine_max_tex * 0.10)
+        confidence: float = min(1.0, self._mine_base_conf + circ_bonus + sol_bonus + tex_bonus)
 
         return _Candidate(
             contour      = contour,
@@ -362,34 +341,35 @@ class ShapeFilter:
 
     def _evaluate_marker(
         self,
-        contour, bbox, area: float,
-        solidity: float, aspect_ratio: float,
+        contour: np.ndarray,
+        bbox: Tuple[int, int, int, int],
+        area: float,
+        solidity: float,
+        aspect_ratio: float,
         circularity: float,
         hsv_frame: Optional[np.ndarray],
     ) -> Optional[_Candidate]:
-        """Apply buried_marker filters and compute heuristic confidence."""
-
-        # Circularity gate (looser than mine — marker may be peg/ring shape)
+        """
+        Evaluate buried mine marker discriminators and color manifold fill.
+        """
         if circularity < self._mrk_min_circ:
             return None
 
-        # Aspect ratio gate
         if not (self._mrk_min_ar <= aspect_ratio <= self._mrk_max_ar):
             return None
 
-        # Solidity gate
         if solidity < self._mrk_min_sol:
             return None
 
-        confidence = self._mrk_base_conf
+        confidence: float = self._mrk_base_conf
 
-        # Optional color gate — boosts confidence significantly if color matches
+        # Optional race-day calibrated color manifold gating
         if self._color_gate_on and hsv_frame is not None:
-            color_fill = self._compute_color_fill(contour, hsv_frame)
+            color_fill: float = self._compute_color_fill(contour, hsv_frame)
             if color_fill < self._color_min_fill:
                 return None
-            color_bonus = min(0.30, color_fill * 0.30)
-            confidence  = min(1.0, confidence + color_bonus)
+            color_bonus: float = min(0.30, color_fill * 0.30)
+            confidence = min(1.0, confidence + color_bonus)
 
         return _Candidate(
             contour      = contour,
@@ -401,9 +381,9 @@ class ShapeFilter:
             confidence   = confidence,
         )
 
-    # ------------------------------------------------------------------
-    # Pixel-level analysis helpers
-    # ------------------------------------------------------------------
+    # -----------------------------------------------------------------------
+    # Pixel-Level Statistics & Convexity Analysis Helpers
+    # -----------------------------------------------------------------------
 
     def _compute_pixel_stats(
         self,
@@ -414,84 +394,59 @@ class ShapeFilter:
         frame_bgr: np.ndarray,
     ) -> Tuple[float, float]:
         """
-        Compute texture_std and color_std for pixels inside the contour.
+        Extract masked pixels inside the candidate contour and compute texture/color standard deviation.
 
         Returns
         -------
         texture_std : float
-            Std dev of grayscale values inside the contour mask.
-            Low → uniform flat disc. High → skin texture / fabric / shadow.
-
+            Standard deviation of grayscale values inside contour.
         color_std : float
-            Mean of per-channel BGR std devs inside the contour mask.
-            Low → one solid colour. High → mixed tones (skin, gradients).
+            Mean of per-channel BGR standard deviations inside contour.
         """
-        # Clamp bbox to frame bounds
-        x1 = max(0, bx)
-        y1 = max(0, by)
-        x2 = min(fw, bx + bw)
-        y2 = min(fh, by + bh)
+        x1: int = max(0, bx)
+        y1: int = max(0, by)
+        x2: int = min(fw, bx + bw)
+        y2: int = min(fh, by + bh)
         if x2 <= x1 or y2 <= y1:
             return 999.0, 999.0
 
-        # Build a local mask (contour shifted to ROI coordinates)
         roi_h, roi_w = y2 - y1, x2 - x1
         local_mask = np.zeros((roi_h, roi_w), dtype=np.uint8)
         shifted = contour - np.array([x1, y1])
         cv2.drawContours(local_mask, [shifted], -1, 255, thickness=cv2.FILLED)
 
-        # Extract interior pixels
-        gray_roi   = gray[y1:y2, x1:x2]
-        gray_pix   = gray_roi[local_mask > 0]
+        gray_roi = gray[y1:y2, x1:x2]
+        gray_pix = gray_roi[local_mask > 0]
 
         if len(gray_pix) == 0:
             return 999.0, 999.0
 
-        texture_std = float(np.std(gray_pix))
+        texture_std: float = float(np.std(gray_pix))
 
-        # Color std — per-channel, then averaged
         bgr_roi = frame_bgr[y1:y2, x1:x2]
-        ch_stds = []
-        for c in range(3):
-            ch_pix = bgr_roi[:, :, c][local_mask > 0]
-            ch_stds.append(float(np.std(ch_pix)))
-        color_std = float(np.mean(ch_stds))
+        ch_stds = [float(np.std(bgr_roi[:, :, c][local_mask > 0])) for c in range(3)]
+        color_std: float = float(np.mean(ch_stds))
 
         return texture_std, color_std
 
     def _compute_max_defect(self, contour: np.ndarray) -> float:
         """
-        Compute the depth (in pixels) of the deepest convexity defect.
+        Compute maximum orthogonal convexity defect depth in pixels.
 
-        A convexity defect is a concavity where the contour dips inward from
-        the convex hull. For a smooth disc → near 0px. For a hand →
-        finger-gap defects of 10-50px at working resolution.
-
-        Returns
-        -------
-        float
-            Maximum defect depth in pixels. Returns 0.0 if no defects found.
+        Smooth circular discs produce near-zero defect depths, whereas branched
+        structures (e.g. human fingers, weeds) produce large depths (> 15 px).
         """
         try:
-            # returnPoints=False needed for convexityDefects
             hull_idx = cv2.convexHull(contour, returnPoints=False)
             if hull_idx is None or len(hull_idx) < 3:
                 return 0.0
             defects = cv2.convexityDefects(contour, hull_idx)
             if defects is None or len(defects) == 0:
                 return 0.0
-            # cv2.convexityDefects returns (N, 1, 4) in most builds but
-            # (N, 4) in some — reshape to (-1, 4) to handle both safely.
-            # Columns: [start_idx, end_idx, far_idx, depth*256]
             defects_flat = defects.reshape(-1, 4)
             return float(defects_flat[:, 3].max()) / 256.0
         except cv2.error:
-            # Can fail on degenerate/self-intersecting contours — treat as no defects
             return 0.0
-
-    # ------------------------------------------------------------------
-    # Color gate helper (marker only)
-    # ------------------------------------------------------------------
 
     def _compute_color_fill(
         self,
@@ -499,8 +454,7 @@ class ShapeFilter:
         hsv_frame: np.ndarray,
     ) -> float:
         """
-        Fraction of contour interior pixels matching the configured HSV range.
-        Returns float in [0.0, 1.0].
+        Compute fraction of interior contour pixels matching the calibrated HSV color manifold.
         """
         h, w = hsv_frame.shape[:2]
         mask = np.zeros((h, w), dtype=np.uint8)
@@ -509,7 +463,7 @@ class ShapeFilter:
         color_mask = cv2.inRange(hsv_frame, self._color_low1, self._color_high1)
         if self._use_hue_wrap:
             color_mask2 = cv2.inRange(hsv_frame, self._color_low2, self._color_high2)
-            color_mask  = cv2.bitwise_or(color_mask, color_mask2)
+            color_mask = cv2.bitwise_or(color_mask, color_mask2)
 
         interior_pixels = cv2.countNonZero(mask)
         if interior_pixels == 0:

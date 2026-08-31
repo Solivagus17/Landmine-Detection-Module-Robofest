@@ -1,117 +1,112 @@
 """
 output/detection_result.py
 ──────────────────────────
-Detection result dataclasses for the Landmine Detection Module.
+Perception Output Contracts and Serial Data Structures.
 
-These structures are the OUTPUT CONTRACT consumed by downstream modules
-(e.g., mapping, localization). Change field names or types here with care.
+Robofest Gujarat 6.0 | Aerial Robotics | Senior Division
 
-JSON serialization is supported out of the box via `to_dict()` / `from_dict()`
-for easy IPC between the detection module and a future mapping module.
+Defines the formal downstream data contract consumed by mapping, SLAM, ray-casting,
+and swarm coordination layers:
+  - `MineClass`: String constants for semantic class labels ('surface_mine', 'buried_marker', 'unknown').
+  - `Detection`: Record of an individual detected target within a single frame.
+  - `FrameResult`: Aggregated frame-level perception record with serialization methods (`.to_dict()`)
+    for IPC streaming over standard output (JSONL), TCP/UDP, or UNIX domain sockets.
+
+Coordinate Convention:
+  Bounding boxes `bbox` are structured as `(x, y, w, h)` in working canvas coordinates (e.g. 480x480).
+  Downstream modules can re-project to native camera sensor coordinates using `scale_x`, `scale_y`
+  and the letterbox padding offsets.
 
 Author: Robofest 6.0 — Landmine Detection Team
 """
 
 from __future__ import annotations
 
-import time
-from dataclasses import dataclass, field, asdict
-from typing import List, Optional
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Tuple
+
 import numpy as np
 
 
-# ---------------------------------------------------------------------------
-# CLASS LABELS
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# Target Semantic Class Enumeration
+# ===========================================================================
 
 class MineClass:
-    """String constants for class labels — use these, not raw strings."""
-    SURFACE_MINE   = "surface_mine"    # Visible mine disc on the ground
-    BURIED_MARKER  = "buried_marker"   # Surface marker above a buried mine
-    UNKNOWN        = "unknown"         # Fallback / low-confidence candidate
+    """String constants defining semantic target classes."""
+    SURFACE_MINE: str  = "surface_mine"   # Circular/oval planar landmine disc
+    BURIED_MARKER: str = "buried_marker"  # Tactical surface indicator for subsurface hazard
+    UNKNOWN: str       = "unknown"        # Unclassified anomaly / fallback candidate
 
 
-# ---------------------------------------------------------------------------
-# SINGLE DETECTION
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# Individual Target Detection Dataclass
+# ===========================================================================
 
 @dataclass
 class Detection:
     """
-    One detected object in a single frame.
+    Data contract encapsulating a single detected target instance.
 
     Fields
     ------
     class_name : str
-        One of MineClass.SURFACE_MINE, MineClass.BURIED_MARKER, MineClass.UNKNOWN.
-
-    bbox : tuple[int, int, int, int]
-        Bounding box in working-resolution pixel coordinates: (x, y, w, h)
-        where (x, y) is the top-left corner.
-        NOTE: These are in the *working* resolution (e.g. 480×480), NOT the
-        native camera resolution. Use FrameResult.working_resolution +
-        FrameResult.scale_x / scale_y to map back to original coordinates.
-
-    contour : np.ndarray or None
-        Raw contour point array, shape (N, 1, 2), dtype int32. May be None
-        if the detector backend doesn't produce per-pixel contours (e.g. YOLO).
-        Useful for precise shape overlay and future segmentation mask generation.
-
+        Target semantic classification label from `MineClass`.
+    bbox : Tuple[int, int, int, int]
+        Axis-aligned bounding box (x, y, w, h) in working canvas coordinates.
     confidence : float
-        Detection confidence in range [0.0, 1.0].
-        For the classical pipeline this is a heuristic score (not a calibrated
-        probability). For YOLO it is the model's objectness × class probability.
-
+        Detection confidence metric in range [0.0, 1.0].
     frame_id : int
-        Monotonically increasing frame counter from the start of the session.
-
+        Monotonically increasing integer frame sequence index.
     timestamp_ms : float
-        Wall-clock timestamp in milliseconds since epoch when the frame was
-        captured. Use this (not frame_id) for time-series reasoning in the
-        mapping module.
-
+        Epoch capture timestamp in milliseconds for time-series flight telemetry fusion.
     detector_backend : str
-        Which backend produced this detection: "classical" | "yolo" | "hybrid".
+        Provenance tag indicating generating backend ('classical' | 'yolo').
+    contour : Optional[np.ndarray], default=None
+        Raw 2D contour point array of shape (N, 1, 2) dtype int32 (excluded from JSON serialization).
     """
 
     class_name:       str
-    bbox:             tuple                  # (x, y, w, h) in working-res pixels
+    bbox:             Tuple[int, int, int, int]
     confidence:       float
     frame_id:         int
     timestamp_ms:     float
     detector_backend: str
     contour:          Optional[np.ndarray] = field(default=None, repr=False)
 
-    # ------------------------------------------------------------------
-    # Derived properties
-    # ------------------------------------------------------------------
+    # -----------------------------------------------------------------------
+    # Spatial Properties
+    # -----------------------------------------------------------------------
 
     @property
-    def center(self) -> tuple[int, int]:
-        """Center of the bounding box (cx, cy)."""
+    def center(self) -> Tuple[int, int]:
+        """Compute bounding box geometric centroid (cx, cy)."""
         x, y, w, h = self.bbox
         return (x + w // 2, y + h // 2)
 
     @property
     def area(self) -> int:
-        """Bounding box area in pixels²."""
+        """Compute 2D bounding rectangle pixel area (width * height)."""
         _, _, w, h = self.bbox
         return w * h
 
-    # ------------------------------------------------------------------
-    # Serialization
-    # ------------------------------------------------------------------
+    # -----------------------------------------------------------------------
+    # Serialization Methods
+    # -----------------------------------------------------------------------
 
-    def to_dict(self) -> dict:
+    def to_dict(self) -> Dict[str, Any]:
         """
-        Serialize to a JSON-compatible dict.
-        Contour is excluded (ndarray not JSON-serializable) — include
-        contour data separately if needed for the mapping module.
+        Serialize detection record to a standard Python dictionary for JSON streaming.
+
+        Returns
+        -------
+        Dict[str, Any]
+            JSON-serializable dictionary representation.
         """
         return {
             "class_name":       self.class_name,
-            "bbox":             list(self.bbox),        # [x, y, w, h]
-            "center":           list(self.center),      # [cx, cy]
+            "bbox":             list(self.bbox),
+            "center":           list(self.center),
             "confidence":       round(self.confidence, 4),
             "frame_id":         self.frame_id,
             "timestamp_ms":     self.timestamp_ms,
@@ -119,83 +114,98 @@ class Detection:
         }
 
     @classmethod
-    def from_dict(cls, d: dict) -> "Detection":
-        """Deserialize from a dict produced by to_dict()."""
+    def from_dict(cls, d: Dict[str, Any]) -> Detection:
+        """
+        Reconstruct a Detection dataclass instance from a dictionary record.
+
+        Parameters
+        ----------
+        d : Dict[str, Any]
+            Dictionary created via .to_dict().
+
+        Returns
+        -------
+        Detection
+            Deserialized instance.
+        """
         return cls(
             class_name       = d["class_name"],
-            bbox             = tuple(d["bbox"]),
-            confidence       = d["confidence"],
-            frame_id         = d["frame_id"],
-            timestamp_ms     = d["timestamp_ms"],
+            bbox             = tuple(d["bbox"]),  # type: ignore
+            confidence       = float(d["confidence"]),
+            frame_id         = int(d["frame_id"]),
+            timestamp_ms     = float(d["timestamp_ms"]),
             detector_backend = d["detector_backend"],
             contour          = None,
         )
 
 
-# ---------------------------------------------------------------------------
-# FRAME-LEVEL RESULT
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# Frame-Level Aggregation Dataclass
+# ===========================================================================
 
 @dataclass
 class FrameResult:
     """
-    All detections from a single video frame.
-
-    This is what downstream modules (mapping, logging) receive per frame.
+    Encapsulates all perception outputs and metadata for a single video frame.
 
     Fields
     ------
     frame_id : int
-        Monotonically increasing frame counter.
-
+        Monotonically increasing integer frame sequence index.
     timestamp_ms : float
-        Wall-clock timestamp in ms when the frame was captured.
-
+        Epoch capture timestamp in milliseconds.
     detections : List[Detection]
-        All confirmed detections in this frame, sorted by confidence descending.
-
-    working_resolution : tuple[int, int]
-        (width, height) of the frame at which detection ran.
-        Needed to interpret Detection.bbox correctly.
-
-    scale_x, scale_y : float
-        Multiply a working-res coordinate by these to get native-res coordinates.
-        Example: native_x = working_x * scale_x
-
-    processing_time_ms : float
-        Total time to process this frame (capture → output), in milliseconds.
+        List of confirmed detections in this frame.
+    working_resolution : Tuple[int, int]
+        (width, height) of the processing canvas in pixels.
+    scale_x : float, default=1.0
+        Horizontal scaling factor relating working coordinates to native frame.
+    scale_y : float, default=1.0
+        Vertical scaling factor relating working coordinates to native frame.
+    processing_time_ms : float, default=0.0
+        Total compute latency for this frame in milliseconds.
     """
 
-    frame_id:            int
-    timestamp_ms:        float
-    detections:          List[Detection]
-    working_resolution:  tuple               # (w, h)
-    scale_x:             float = 1.0
-    scale_y:             float = 1.0
-    processing_time_ms:  float = 0.0
+    frame_id:           int
+    timestamp_ms:       float
+    detections:         List[Detection]
+    working_resolution: Tuple[int, int]
+    scale_x:            float = 1.0
+    scale_y:            float = 1.0
+    processing_time_ms: float = 0.0
 
-    # ------------------------------------------------------------------
-    # Convenience
-    # ------------------------------------------------------------------
+    # -----------------------------------------------------------------------
+    # Filtering Properties
+    # -----------------------------------------------------------------------
 
     @property
     def has_detections(self) -> bool:
+        """True if one or more confirmed detections exist in this frame."""
         return len(self.detections) > 0
 
     @property
     def surface_mines(self) -> List[Detection]:
+        """Filter detections matching MineClass.SURFACE_MINE."""
         return [d for d in self.detections if d.class_name == MineClass.SURFACE_MINE]
 
     @property
     def buried_markers(self) -> List[Detection]:
+        """Filter detections matching MineClass.BURIED_MARKER."""
         return [d for d in self.detections if d.class_name == MineClass.BURIED_MARKER]
 
-    # ------------------------------------------------------------------
-    # Serialization
-    # ------------------------------------------------------------------
+    # -----------------------------------------------------------------------
+    # Serialization Methods
+    # -----------------------------------------------------------------------
 
-    def to_dict(self) -> dict:
-        """Serialize to a JSON-compatible dict (one line per frame in JSONL output)."""
+    def to_dict(self) -> Dict[str, Any]:
+        """
+        Serialize frame result to a JSON-serializable dictionary (JSONL format).
+
+        Returns
+        -------
+        Dict[str, Any]
+            Dictionary containing frame metadata and serialized detection records.
+        """
         return {
             "frame_id":           self.frame_id,
             "timestamp_ms":       self.timestamp_ms,

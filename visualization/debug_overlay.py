@@ -1,34 +1,36 @@
 """
 visualization/debug_overlay.py
 ────────────────────────────────
-Debug visualization overlay for the Landmine Detection Module.
+Diagnostic Visualization HUD and Real-Time Feedback Overlay Engine.
 
-Renders detection results on the live frame for real-time tuning on a laptop.
-Controlled by the `debug` section of config.yaml — set `enabled: false`
-for headless/deployment mode (e.g., on Pi 5 during the actual flight).
+Robofest Gujarat 6.0 | Aerial Robotics | Senior Division
 
-Overlay contents:
-  - Semi-transparent filled contour OR bounding box per detection
-  - Class label + confidence text
-  - FPS counter (top-left)
-  - Active detector backend name (top-right)
-  - Detection count per class (bottom-left)
+Renders live diagnostic overlays on conditioned video frames for interactive bench tuning:
+  - Semi-transparent filled contours (alpha=0.25) and bounding boxes per detection.
+  - Semantic class labels and calibrated confidence pills.
+  - Rolling 30-frame average FPS counter (top-left).
+  - Active detection backend provenance indicator (top-right).
+  - Real-time detection count and per-frame compute latency summary (bottom-left).
 
-Color coding (configurable in config.yaml):
-  - surface_mine   → Green by default
-  - buried_marker  → Teal/Blue by default
-  - unknown        → Grey
+Display Auto-Scaling:
+  Detection algorithms run strictly at `working_resolution` (e.g., 480x480 or 320x320) to
+  minimize latency on Raspberry Pi Zero 2 W. The debug overlay dynamically upscales the
+  output canvas to fill the host workstation monitor without introducing distortion.
+
+Deployment Note:
+  In production flight on the drone, disable this module (`debug.enabled: false` or `--no-debug`)
+  to eliminate X11/GUI thread overhead and conserve 512 MB RAM.
 
 Author: Robofest 6.0 — Landmine Detection Team
 """
 
 from __future__ import annotations
 
-import time
 import logging
 import platform
+import time
 from collections import deque
-from typing import List, Optional, Tuple
+from typing import Deque, List, Optional, Tuple, Union
 
 import cv2
 import numpy as np
@@ -38,21 +40,26 @@ from output.detection_result import Detection, FrameResult, MineClass
 logger = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------------------------
-# Screen resolution helper
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# Display Dimension Resolution Helper
+# ===========================================================================
 
 def _get_screen_size() -> Tuple[int, int]:
     """
-    Return (width, height) of the primary display.
-    Uses ctypes on Windows (no extra dependency).
-    Falls back to a sensible default on other platforms.
+    Detect primary display resolution in pixels (width, height).
+
+    Employs Windows user32 DPI-aware probe or cross-platform OpenCV probe,
+    falling back to 1280x720 if windowing context is unavailable.
+
+    Returns
+    -------
+    Tuple[int, int]
+        Physical display dimensions (width, height).
     """
     try:
         if platform.system() == "Windows":
             import ctypes
             user32 = ctypes.windll.user32
-            # SetProcessDPIAware so we get physical pixels, not scaled ones
             try:
                 ctypes.windll.shcore.SetProcessDpiAwareness(2)
             except Exception:
@@ -63,86 +70,78 @@ def _get_screen_size() -> Tuple[int, int]:
                 return w, h
     except Exception:
         pass
-    # Cross-platform fallback via OpenCV (creates a tiny temp window)
+
     try:
-        tmp = "__screen_probe__"
-        cv2.namedWindow(tmp, cv2.WINDOW_NORMAL)
-        cv2.setWindowProperty(tmp, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
-        # Give it one event loop tick
+        tmp_win = "__screen_probe__"
+        cv2.namedWindow(tmp_win, cv2.WINDOW_NORMAL)
+        cv2.setWindowProperty(tmp_win, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
         cv2.waitKey(1)
-        rect = cv2.getWindowImageRect(tmp)
-        cv2.destroyWindow(tmp)
+        rect = cv2.getWindowImageRect(tmp_win)
+        cv2.destroyWindow(tmp_win)
         if rect[2] > 0 and rect[3] > 0:
             return rect[2], rect[3]
     except Exception:
         pass
-    logger.warning("Could not detect screen size — defaulting to 1280x720")
+
+    logger.warning("Unable to detect display resolution — defaulting to 1280x720")
     return 1280, 720
 
 
-# ---------------------------------------------------------------------------
-# DebugOverlay
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# Diagnostic Overlay Engine
+# ===========================================================================
 
 class DebugOverlay:
     """
-    Draws detection results on a frame for interactive tuning.
+    Renders diagnostic HUD elements, bounding geometries, and telemetry overlays.
 
     Parameters
     ----------
     debug_cfg : dict
-        The `debug` section of config.yaml.
+        The `debug` section from config.yaml.
     """
 
-    def __init__(self, debug_cfg: dict):
-        self._enabled      = bool(debug_cfg.get("enabled", True))
-        self._draw_fill    = bool(debug_cfg.get("draw_contour_fill", True))
-        self._fill_alpha   = float(debug_cfg.get("contour_fill_alpha", 0.25))
-        self._draw_bbox    = bool(debug_cfg.get("draw_bbox", True))
-        self._show_fps     = bool(debug_cfg.get("show_fps", True))
-        self._show_backend = bool(debug_cfg.get("show_backend_label", True))
-        self._window_title = str(debug_cfg.get("window_title", "Landmine Detection"))
+    def __init__(self, debug_cfg: dict) -> None:
+        self._enabled: bool = bool(debug_cfg.get("enabled", True))
+        self._draw_fill: bool = bool(debug_cfg.get("draw_contour_fill", True))
+        self._fill_alpha: float = float(debug_cfg.get("contour_fill_alpha", 0.25))
+        self._draw_bbox: bool = bool(debug_cfg.get("draw_bbox", True))
+        self._show_fps: bool = bool(debug_cfg.get("show_fps", True))
+        self._show_backend: bool = bool(debug_cfg.get("show_backend_label", True))
+        self._window_title: str = str(debug_cfg.get("window_title", "Landmine Detection - Debug View"))
 
-        def _to_bgr(lst, default) -> Tuple[int, int, int]:
+        def _to_bgr(lst: Any, default: Tuple[int, int, int]) -> Tuple[int, int, int]:
             if isinstance(lst, (list, tuple)) and len(lst) == 3:
                 return (int(lst[0]), int(lst[1]), int(lst[2]))
             return default
 
-        self._color_mine   = _to_bgr(debug_cfg.get("color_surface_mine"),  (50,  220,  50))
-        self._color_marker = _to_bgr(debug_cfg.get("color_buried_marker"), (220, 120,  50))
-        self._color_unk    = _to_bgr(debug_cfg.get("color_unknown"),       (200, 200, 200))
+        self._color_mine: Tuple[int, int, int]   = _to_bgr(debug_cfg.get("color_surface_mine"),  (50,  220,  50))
+        self._color_marker: Tuple[int, int, int] = _to_bgr(debug_cfg.get("color_buried_marker"), (220, 120,  50))
+        self._color_unk: Tuple[int, int, int]    = _to_bgr(debug_cfg.get("color_unknown"),       (200, 200, 200))
 
-        # Rolling FPS buffer (last 30 frame times)
-        self._frame_times: deque = deque(maxlen=30)
+        # Rolling 30-frame timing buffer for FPS estimation
+        self._frame_times: Deque[float] = deque(maxlen=30)
 
-        # OpenCV font settings
-        self._font       = cv2.FONT_HERSHEY_SIMPLEX
-        self._font_scale = 0.55
-        self._font_thick = 1
+        # Typography configuration
+        self._font: int = cv2.FONT_HERSHEY_SIMPLEX
+        self._font_scale: float = 0.55
+        self._font_thick: int = 1
 
-        # --- Display / window sizing ---
-        # Detect screen resolution and compute the display frame size.
-        # Detection always runs at working_resolution (e.g. 480x480);
-        # we upscale ONLY for display so the window fills the screen.
+        # Display window scaling setup
         screen_w, screen_h = _get_screen_size()
-        # Use a configurable fraction of the screen (default 95%)
-        frac = float(debug_cfg.get("display_screen_fraction", 0.95))
-        self._display_w = int(screen_w * frac)
-        self._display_h = int(screen_h * frac)
-        self._screen_w  = screen_w
-        self._screen_h  = screen_h
-        self._window_created = False   # lazy window creation on first show()
+        frac: float = float(debug_cfg.get("display_screen_fraction", 0.95))
+        self._display_w: int = int(screen_w * frac)
+        self._display_h: int = int(screen_h * frac)
+        self._window_created: bool = False
 
         logger.info(
-            "DebugOverlay ready — screen: %dx%d, display window: %dx%d, "
-            "fill: %s, fps: %s",
-            screen_w, screen_h, self._display_w, self._display_h,
-            self._draw_fill, self._show_fps,
+            "DebugOverlay initialized (window=%dx%d, contour_fill=%s, fps_hud=%s)",
+            self._display_w, self._display_h, self._draw_fill, self._show_fps,
         )
 
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
+    # -----------------------------------------------------------------------
+    # Public Rendering & Display Methods
+    # -----------------------------------------------------------------------
 
     def render(
         self,
@@ -151,36 +150,33 @@ class DebugOverlay:
         backend_name: str = "classical",
     ) -> np.ndarray:
         """
-        Draw debug overlay on a frame.
+        Draw all diagnostic annotations and telemetry metrics onto a frame copy.
 
         Parameters
         ----------
         frame : np.ndarray
-            BGR frame at working resolution (will be drawn on in-place copy).
+            BGR image at working resolution.
         result : FrameResult
-            Detection results for this frame.
-        backend_name : str
-            Detector backend label for overlay display.
+            Perception records for the current frame.
+        backend_name : str, default="classical"
+            Active detector backend tag.
 
         Returns
         -------
         np.ndarray
-            Annotated BGR frame (new array — original is not modified).
+            Annotated BGR image.
         """
         if not self._enabled:
             return frame
 
-        # Work on a copy — do not mutate the original frame
-        out = frame.copy()
-
-        # Track frame times for FPS calculation
+        out: np.ndarray = frame.copy()
         self._frame_times.append(time.monotonic())
 
-        # Draw each detection
+        # Render individual detection contours and bounding boxes
         for det in result.detections:
             self._draw_detection(out, det)
 
-        # Overlay text elements
+        # Render telemetry HUD elements
         if self._show_fps:
             self._draw_fps(out)
 
@@ -193,54 +189,50 @@ class DebugOverlay:
 
     def show(self, frame: np.ndarray) -> bool:
         """
-        Display the frame in an OpenCV window.
+        Display annotated frame in an OpenCV window scaled to monitor geometry.
 
         Returns
         -------
         bool
-            False if the user pressed 'q' or Escape (quit signal), True otherwise.
+            False if 'q' or Escape key was pressed, True otherwise.
         """
         if not self._enabled:
             return True
 
-        # --- Create window once, sized to screen ---
         if not self._window_created:
             cv2.namedWindow(self._window_title, cv2.WINDOW_NORMAL)
             cv2.resizeWindow(self._window_title, self._display_w, self._display_h)
-            # Move to top-left corner so it doesn't hide behind the taskbar
             cv2.moveWindow(self._window_title, 0, 0)
             self._window_created = True
 
-        # --- Upscale display frame to fill the window ---
-        # The input frame is at working resolution (e.g. 480x480).
-        # We letterbox it again into display_w x display_h so aspect ratio
-        # is preserved but the window is fully sized to the screen.
+        # Upscale working canvas to fit display window without aspect distortion
         fh, fw = frame.shape[:2]
-        scale    = min(self._display_w / fw, self._display_h / fh)
-        scaled_w = int(fw * scale)
-        scaled_h = int(fh * scale)
-        display  = cv2.resize(frame, (scaled_w, scaled_h), interpolation=cv2.INTER_LINEAR)
+        scale: float = min(self._display_w / fw, self._display_h / fh)
+        scaled_w: int = int(fw * scale)
+        scaled_h: int = int(fh * scale)
+        display: np.ndarray = cv2.resize(frame, (scaled_w, scaled_h), interpolation=cv2.INTER_LINEAR)
 
-        # Pad to exact display_w x display_h with a dark grey border
-        canvas = np.full((self._display_h, self._display_w, 3), 30, dtype=np.uint8)
-        pad_x  = (self._display_w - scaled_w) // 2
-        pad_y  = (self._display_h - scaled_h) // 2
+        # Pad canvas with dark grey borders
+        canvas: np.ndarray = np.full((self._display_h, self._display_w, 3), 30, dtype=np.uint8)
+        pad_x: int = (self._display_w - scaled_w) // 2
+        pad_y: int = (self._display_h - scaled_h) // 2
         canvas[pad_y:pad_y + scaled_h, pad_x:pad_x + scaled_w] = display
 
         cv2.imshow(self._window_title, canvas)
-        key = cv2.waitKey(1) & 0xFF
-        return key not in (ord("q"), 27)   # 27 = Escape
+        key: int = cv2.waitKey(1) & 0xFF
+        return key not in (ord("q"), 27)
 
     def close(self) -> None:
-        """Destroy all OpenCV windows."""
+        """Close all OpenCV display windows."""
         if self._enabled:
             cv2.destroyAllWindows()
 
-    # ------------------------------------------------------------------
-    # Internal drawing helpers
-    # ------------------------------------------------------------------
+    # -----------------------------------------------------------------------
+    # Internal Annotation Helpers
+    # -----------------------------------------------------------------------
 
     def _get_color(self, class_name: str) -> Tuple[int, int, int]:
+        """Resolve BGR color for semantic class."""
         if class_name == MineClass.SURFACE_MINE:
             return self._color_mine
         if class_name == MineClass.BURIED_MARKER:
@@ -248,33 +240,32 @@ class DebugOverlay:
         return self._color_unk
 
     def _draw_detection(self, out: np.ndarray, det: Detection) -> None:
-        """Draw contour fill + bounding box + label for one detection."""
+        """Draw alpha-blended contour fill, outer stroke, and label pill."""
         color = self._get_color(det.class_name)
         x, y, w, h = det.bbox
 
-        # --- Semi-transparent contour fill ---
+        # Alpha-blended filled contour
         if self._draw_fill and det.contour is not None:
             overlay = out.copy()
             cv2.drawContours(overlay, [det.contour], -1, color, thickness=cv2.FILLED)
             cv2.addWeighted(overlay, self._fill_alpha, out, 1 - self._fill_alpha, 0, out)
-            # Solid contour border
             cv2.drawContours(out, [det.contour], -1, color, thickness=2)
 
-        # --- Bounding box ---
+        # Bounding rectangle
         if self._draw_bbox:
             cv2.rectangle(out, (x, y), (x + w, y + h), color, thickness=2)
 
-        # --- Label: "class  0.73" ---
-        label      = f"{det.class_name}  {det.confidence:.2f}"
-        text_size  = cv2.getTextSize(label, self._font, self._font_scale, self._font_thick)[0]
-        text_x     = x
-        text_y     = max(y - 6, text_size[1] + 4)
+        # Semantic label and confidence score
+        label: str = f"{det.class_name}  {det.confidence:.2f}"
+        text_size = cv2.getTextSize(label, self._font, self._font_scale, self._font_thick)[0]
+        text_x: int = x
+        text_y: int = max(y - 6, text_size[1] + 4)
 
-        # Dark background pill for readability
-        bg_x1 = text_x - 2
-        bg_y1 = text_y - text_size[1] - 4
-        bg_x2 = text_x + text_size[0] + 4
-        bg_y2 = text_y + 2
+        # Contrast pill background
+        bg_x1: int = text_x - 2
+        bg_y1: int = text_y - text_size[1] - 4
+        bg_x2: int = text_x + text_size[0] + 4
+        bg_y2: int = text_y + 2
         cv2.rectangle(out, (bg_x1, bg_y1), (bg_x2, bg_y2), (20, 20, 20), thickness=-1)
 
         cv2.putText(
@@ -285,24 +276,21 @@ class DebugOverlay:
         )
 
     def _draw_fps(self, out: np.ndarray) -> None:
-        """Draw FPS counter top-left."""
-        fps = self._compute_fps()
-        label = f"FPS: {fps:.1f}"
+        """Render rolling average FPS counter."""
+        fps: float = self._compute_fps()
+        label: str = f"FPS: {fps:.1f}"
         self._put_hud_text(out, label, row=0, col="left")
 
     def _draw_backend_label(self, out: np.ndarray, backend_name: str) -> None:
-        """Draw backend name top-right."""
-        label = f"MODE: {backend_name.upper()}"
+        """Render active detector backend indicator."""
+        label: str = f"BACKEND: {backend_name.upper()}"
         self._put_hud_text(out, label, row=0, col="right")
 
     def _draw_detection_summary(self, out: np.ndarray, result: FrameResult) -> None:
-        """Draw detection counts bottom-left."""
-        n_mines   = len(result.surface_mines)
-        n_markers = len(result.buried_markers)
-        label = (
-            f"Mines: {n_mines}  |  Markers: {n_markers}  |  "
-            f"[{result.processing_time_ms:.1f} ms]"
-        )
+        """Render detection counts and per-frame compute latency."""
+        n_mines: int = len(result.surface_mines)
+        n_markers: int = len(result.buried_markers)
+        label: str = f"Mines: {n_mines}  |  Markers: {n_markers}  |  [{result.processing_time_ms:.1f} ms]"
         h = out.shape[0]
         cv2.putText(
             out, label,
@@ -318,14 +306,10 @@ class DebugOverlay:
         row: int = 0,
         col: str = "left",
     ) -> None:
-        """
-        Place a HUD text element at a grid position.
-        row=0 → near top, col="left"|"right"
-        """
-        line_h  = 22
-        margin  = 8
-        text_y  = margin + line_h * (row + 1)
-
+        """Place text with drop shadow at a structured HUD grid position."""
+        line_h: int = 22
+        margin: int = 8
+        text_y: int = margin + line_h * (row + 1)
         text_size = cv2.getTextSize(text, self._font, 0.50, 1)[0]
 
         if col == "right":
@@ -333,17 +317,16 @@ class DebugOverlay:
         else:
             text_x = margin
 
-        # Shadow
-        cv2.putText(out, text, (text_x + 1, text_y + 1),
-                    self._font, 0.50, (0, 0, 0), 2, cv2.LINE_AA)
-        # Foreground
-        cv2.putText(out, text, (text_x, text_y),
-                    self._font, 0.50, (240, 240, 240), 1, cv2.LINE_AA)
+        # Shadow stroke
+        cv2.putText(out, text, (text_x + 1, text_y + 1), self._font, 0.50, (0, 0, 0), 2, cv2.LINE_AA)
+        # Foreground text
+        cv2.putText(out, text, (text_x, text_y), self._font, 0.50, (240, 240, 240), 1, cv2.LINE_AA)
 
     def _compute_fps(self) -> float:
+        """Compute rolling average FPS across recent frame timestamps."""
         if len(self._frame_times) < 2:
             return 0.0
         elapsed = self._frame_times[-1] - self._frame_times[0]
-        if elapsed <= 0:
+        if elapsed <= 0.0:
             return 0.0
         return (len(self._frame_times) - 1) / elapsed

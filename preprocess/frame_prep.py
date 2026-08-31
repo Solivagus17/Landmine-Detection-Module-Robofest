@@ -1,21 +1,21 @@
 """
 preprocess/frame_prep.py
 ─────────────────────────
-Frame preprocessing pipeline for the Landmine Detection Module.
+Photometric and Geometric Conditioning Pipeline.
 
-Responsibilities
-----------------
-1. Resize native camera frame to working resolution (letterbox — preserves
-   aspect ratio, pads with black) so downstream detection always sees a
-   consistent pixel grid.
-2. Optionally apply CLAHE for contrast enhancement (useful on overcast days
-   or shadowed terrain).
-3. Optionally apply Gaussian blur to reduce sensor noise before edge detection.
-4. Return both the preprocessed frame AND the scale/offset metadata needed to
-   map detection coordinates back to the original frame if required.
+Robofest Gujarat 6.0 | Aerial Robotics | Senior Division
 
-All parameters are driven by the `preprocessing` and `camera` sections of
-config.yaml — no magic numbers here.
+Responsibilities:
+  1. Metric Letterboxing: Uniformly scales incoming native camera frames (from Luxonis OAK-D Lite)
+     into a fixed square working canvas (e.g., 480x480 or 320x320) with neutral grey padding (114),
+     preserving the metric aspect ratio of circular ground targets without non-affine distortion.
+  2. Luminance-Isolated CLAHE: Transforms BGR to CIE L*a*b* color space and equalizes only the
+     lightness L* channel (clipLimit=2.0, tileGridSize=8x8), enhancing contrast on shadowed or
+     overcast terrain without altering chromatic ratios.
+  3. Gaussian Noise Filtering: Attenuates high-frequency sensor noise and Bayer artifacts prior to
+     spatial gradient extraction.
+  4. Spatial Inversion Metadata: Generates and returns a `LetterboxInfo` dataclass instance containing
+     exact scale factors and offsets for re-projecting bounding coordinates back to native space.
 
 Author: Robofest 6.0 — Landmine Detection Team
 """
@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Tuple
+from typing import Optional, Tuple
 
 import cv2
 import numpy as np
@@ -32,109 +32,124 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------------------------
-# Letterbox metadata
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# Coordinate Transformation Metadata Dataclass
+# ===========================================================================
 
-@dataclass
+@dataclass(frozen=True)
 class LetterboxInfo:
     """
-    Metadata describing how the original frame was transformed to the working
-    resolution. Use these values to map coordinates back to the original.
+    Encapsulates affine coordinate mapping parameters between native and working resolutions.
 
-    Example (map a detection bbox back to native resolution):
-        native_x = int((bbox_x - pad_x) / scale)
-        native_y = int((bbox_y - pad_y) / scale)
-        native_w = int(bbox_w / scale)
-        native_h = int(bbox_h / scale)
+    Fields
+    ------
+    orig_w : int
+        Native sensor frame width in pixels (e.g. 1920 or 1280).
+    orig_h : int
+        Native sensor frame height in pixels (e.g. 1080 or 720).
+    target_w : int
+        Working canvas width in pixels (e.g. 480 or 320).
+    target_h : int
+        Working canvas height in pixels (e.g. 480 or 320).
+    scale : float
+        Uniform isotropic scaling factor: min(target_w / orig_w, target_h / orig_h).
+    pad_x : int
+        Horizontal padding offset in pixels applied to each side.
+    pad_y : int
+        Vertical padding offset in pixels applied to each side.
+    scale_x : float
+        Effective horizontal scale factor: (orig_w * scale) / orig_w.
+    scale_y : float
+        Effective vertical scale factor: (orig_h * scale) / orig_h.
+
+    Coordinate Inversion Formula:
+        native_x = (working_x - pad_x) / scale
+        native_y = (working_y - pad_y) / scale
     """
-    orig_w:       int     # Native frame width
-    orig_h:       int     # Native frame height
-    target_w:     int     # Working-resolution width
-    target_h:     int     # Working-resolution height
-    scale:        float   # Single scale factor (same for both axes — uniform scaling)
-    pad_x:        int     # Left padding in px (black border added by letterbox)
-    pad_y:        int     # Top padding in px
-    scale_x:      float   # Convenience: target_w / orig_w (without padding)
-    scale_y:      float   # Convenience: target_h / orig_h (without padding)
+    orig_w:   int
+    orig_h:   int
+    target_w: int
+    target_h: int
+    scale:    float
+    pad_x:    int
+    pad_y:    int
+    scale_x:  float
+    scale_y:  float
 
 
-# ---------------------------------------------------------------------------
-# FramePreprocessor
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# Frame Preprocessor Engine
+# ===========================================================================
 
 class FramePreprocessor:
     """
-    Stateful preprocessor — built once from config, called per frame.
+    Stateful image preprocessor managing spatial rescaling and photometric equalization.
 
     Parameters
     ----------
     camera_cfg : dict
-        The `camera` section of config.yaml.
+        The `camera` section from config.yaml containing working resolution targets.
     preprocessing_cfg : dict
-        The `preprocessing` section of config.yaml.
+        The `preprocessing` section from config.yaml controlling CLAHE and Gaussian blur.
     """
 
-    def __init__(self, camera_cfg: dict, preprocessing_cfg: dict):
-        self._target_w = int(camera_cfg.get("working_width",  480))
-        self._target_h = int(camera_cfg.get("working_height", 480))
+    def __init__(self, camera_cfg: dict, preprocessing_cfg: dict) -> None:
+        self._target_w: int = int(camera_cfg.get("working_width", 480))
+        self._target_h: int = int(camera_cfg.get("working_height", 480))
 
         pp = preprocessing_cfg
-        self._use_clahe         = bool(pp.get("use_clahe", True))
-        self._clahe_clip        = float(pp.get("clahe_clip_limit", 2.0))
-        self._clahe_tile        = int(pp.get("clahe_tile_size", 8))
-        self._blur_k            = int(pp.get("blur_kernel_size", 3))
-        self._blur_sigma        = float(pp.get("blur_sigma", 0))
+        self._use_clahe: bool = bool(pp.get("use_clahe", True))
+        self._clahe_clip: float = float(pp.get("clahe_clip_limit", 2.0))
+        self._clahe_tile: int = int(pp.get("clahe_tile_size", 8))
+        self._blur_k: int = int(pp.get("blur_kernel_size", 3))
+        self._blur_sigma: float = float(pp.get("blur_sigma", 0))
 
-        # Validate blur kernel is odd and positive
+        # Enforce odd aperture size for Gaussian convolution
         if self._blur_k > 0 and self._blur_k % 2 == 0:
             self._blur_k += 1
-            logger.warning(
-                "blur_kernel_size must be odd — bumped to %d", self._blur_k
-            )
+            logger.warning("blur_kernel_size must be odd — adjusted to %d", self._blur_k)
 
-        # Pre-build CLAHE object (avoid re-creation per frame)
+        # Pre-allocate CLAHE operator descriptor
+        self._clahe: Optional[cv2.CLAHE] = None
         if self._use_clahe:
             self._clahe = cv2.createCLAHE(
                 clipLimit=self._clahe_clip,
                 tileGridSize=(self._clahe_tile, self._clahe_tile),
             )
-        else:
-            self._clahe = None
 
         logger.info(
-            "FramePreprocessor ready — target: %dx%d, CLAHE: %s, blur_k: %d",
-            self._target_w, self._target_h, self._use_clahe, self._blur_k,
+            "FramePreprocessor initialized (canvas=%dx%d, CLAHE=%s [clip=%.1f, grid=%d], blur_k=%d)",
+            self._target_w, self._target_h, self._use_clahe, self._clahe_clip, self._clahe_tile, self._blur_k,
         )
 
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
+    # -----------------------------------------------------------------------
+    # Public Execution Method
+    # -----------------------------------------------------------------------
 
     def process(self, frame: np.ndarray) -> Tuple[np.ndarray, LetterboxInfo]:
         """
-        Preprocess a raw camera frame.
+        Execute the full geometric and photometric preprocessing sequence.
 
         Parameters
         ----------
         frame : np.ndarray
-            BGR frame from CameraSource.read(), shape (H, W, 3).
+            Raw BGR input frame from CameraSource.read() of shape (H, W, 3).
 
         Returns
         -------
         processed : np.ndarray
-            BGR preprocessed frame at working resolution, shape (target_h, target_w, 3).
+            Conditioned BGR image of shape (target_h, target_w, 3) ready for candidate proposal.
         info : LetterboxInfo
-            Coordinate mapping metadata.
+            Coordinate mapping metadata for native frame projection.
         """
-        # 1. Letterbox resize
+        # Step 1: Metric aspect-ratio preserving letterbox resize
         processed, info = self._letterbox(frame)
 
-        # 2. CLAHE contrast enhancement (applied to L channel in LAB colorspace)
+        # Step 2: CIE L*a*b* luminance-channel CLAHE equalization
         if self._use_clahe and self._clahe is not None:
             processed = self._apply_clahe(processed)
 
-        # 3. Gaussian blur
+        # Step 3: High-frequency Gaussian spatial smoothing
         if self._blur_k > 0:
             processed = cv2.GaussianBlur(
                 processed,
@@ -144,62 +159,57 @@ class FramePreprocessor:
 
         return processed, info
 
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
+    # -----------------------------------------------------------------------
+    # Internal Transformation Helpers
+    # -----------------------------------------------------------------------
 
-    def _letterbox(
-        self, frame: np.ndarray
-    ) -> Tuple[np.ndarray, LetterboxInfo]:
+    def _letterbox(self, frame: np.ndarray) -> Tuple[np.ndarray, LetterboxInfo]:
         """
-        Resize frame to target resolution while preserving aspect ratio.
-        Pads with black (128, 128, 128 grey) to fill the target canvas.
+        Resize image to square target dimensions while preserving isotropic aspect ratio.
 
-        This is the standard letterbox approach used by YOLO preprocessing —
-        consistent with how we'd feed frames to the YOLO upgrade path later.
+        Pads margins with neutral grey (114, 114, 114) consistent with neural model standards.
         """
         orig_h, orig_w = frame.shape[:2]
         target_w, target_h = self._target_w, self._target_h
 
-        # Compute uniform scale to fit within target without cropping
-        scale = min(target_w / orig_w, target_h / orig_h)
+        # Compute uniform scale to fit within canvas bounds
+        scale: float = min(target_w / orig_w, target_h / orig_h)
+        new_w: int = int(round(orig_w * scale))
+        new_h: int = int(round(orig_h * scale))
 
-        new_w = int(round(orig_w * scale))
-        new_h = int(round(orig_h * scale))
+        # Centering offsets
+        pad_x: int = (target_w - new_w) // 2
+        pad_y: int = (target_h - new_h) // 2
 
-        # Padding to center the resized image
-        pad_x = (target_w - new_w) // 2
-        pad_y = (target_h - new_h) // 2
-
+        # Bilinear interpolation resize
         resized = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
 
-        # Create grey canvas and place resized frame in center
+        # Initialize grey canvas and embed resized frame
         canvas = np.full((target_h, target_w, 3), 114, dtype=np.uint8)
         canvas[pad_y : pad_y + new_h, pad_x : pad_x + new_w] = resized
 
         info = LetterboxInfo(
-            orig_w  = orig_w,
-            orig_h  = orig_h,
+            orig_w   = orig_w,
+            orig_h   = orig_h,
             target_w = target_w,
             target_h = target_h,
-            scale   = scale,
-            pad_x   = pad_x,
-            pad_y   = pad_y,
-            scale_x = new_w / orig_w,
-            scale_y = new_h / orig_h,
+            scale    = scale,
+            pad_x    = pad_x,
+            pad_y    = pad_y,
+            scale_x  = new_w / orig_w,
+            scale_y  = new_h / orig_h,
         )
 
         return canvas, info
 
     def _apply_clahe(self, frame: np.ndarray) -> np.ndarray:
         """
-        Apply CLAHE to the L (luminance) channel of the LAB colorspace.
+        Apply Contrast Limited Adaptive Histogram Equalization exclusively to luminance.
 
-        This improves local contrast without oversaturating colors, which is
-        important for detecting low-contrast mine discs on similar-tone terrain.
+        Decouples chromaticity from intensity, preventing chromatic artifacting.
         """
         lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
         l_ch, a_ch, b_ch = cv2.split(lab)
         l_ch = self._clahe.apply(l_ch)
-        lab  = cv2.merge([l_ch, a_ch, b_ch])
+        lab = cv2.merge([l_ch, a_ch, b_ch])
         return cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)

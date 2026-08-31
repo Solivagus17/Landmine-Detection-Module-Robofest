@@ -11,15 +11,17 @@
 # CAMERA / INPUT SOURCE
 # -----------------------------------------------------------------------------
 camera:
-  # Source: integer (webcam index), file path (video/image), or RTSP URL string.
+  # Source: integer (device index for Luxonis OAK-D Lite /dev/video0),
+  # file path (video/image sequence), or RTSP URL string.
   # Examples:
-  #   source: 0                          # Default webcam
-  #   source: "test_footage.mp4"         # Video file
+  #   source: 0                          # Default OAK-D Lite UVC stream (/dev/video0)
+  #   source: "test_footage.mp4"         # Video file recording
   #   source: "rtsp://192.168.1.10/stream" # Drone RTSP stream
   source: 0
 
   # Working resolution (width x height) — all detection runs at this size.
-  # Lower = faster on Pi 5. Recommended: 480 for laptop dev, 320 for Pi 5 deploy.
+  # Lower = lower latency and minimal memory footprint on Raspberry Pi Zero 2 W.
+  # Recommended: 480 for laptop dev, 320 for RPi Zero 2 W deployment (512MB RAM).
   working_width: 480
   working_height: 480
 
@@ -236,7 +238,7 @@ yolo:
   # Flip this to "yolo" once you have a trained model to use YOLO instead of classical.
   # All other modules remain unchanged.
   enabled: false
-  model_path: "models/mine_detector.pt"   # or .ncnn for Pi 5
+  model_path: "models/mine_detector.pt"   # .onnx for host CPU, or OpenVINO/blob for OAK-D Lite VPU
   input_size: 320             # px, YOLO inference resolution
   confidence_threshold: 0.40
   iou_threshold: 0.45         # NMS IoU threshold

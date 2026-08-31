@@ -1,9 +1,16 @@
+# =============================================================================
+# Robofest 6.0 Landmine Perception Subsystem — Python Dependencies
+# Target Hardware: Raspberry Pi Zero 2 W + Luxonis OAK-D Lite
+# =============================================================================
+
+# --- Core Perception & Preprocessing Pipeline ---
 opencv-python>=4.8.0
 numpy>=1.24.0
 PyYAML>=6.0
 
-# Optional — for YOLO upgrade path (install only when needed):
+# --- Optional Neural Upgrade Slots (Install only when needed) ---
+# YOLO Neural Object Detection Engine:
 # ultralytics>=8.0.0
 
-# Optional — for CNN patch classifier upgrade (install only when needed):
+# CNN Patch-Level Verification Engine (ONNX Runtime):
 # onnxruntime>=1.16.0

@@ -1,36 +1,46 @@
 """
 main.py
-────────
-Entry point for the Landmine Detection Module.
+───────
+Application Entry Point and Execution Orchestrator for the Landmine Detection Subsystem.
 
-Wires all components together and runs the real-time detection loop:
-  CameraSource → FramePreprocessor → Detector → FrameResult → [Output] → DebugOverlay
+Robofest Gujarat 6.0 | Aerial Robotics (Senior Category) | Minefield Navigation
 
-Usage
------
-  # Default: webcam, debug overlay, config.yaml in current directory
+Pipeline Topology:
+  CameraSource (Luxonis OAK-D Lite / UVC / Video / RTSP)
+    └──▶ FramePreprocessor (Metric Letterbox + CIE LAB-CLAHE + Gaussian Blur)
+          └──▶ Detector (Classical 9-Stage CV or YOLO Neural Backend)
+                └──▶ FrameResult (Normalized Dataclass & Serializer)
+                      ├──▶ Output Stream (JSON Lines to stdout / File IPC)
+                      └──▶ DebugOverlay (Diagnostic Visualizer & Interactive HUD)
+
+Target Hardware:
+  - Host SBC: Raspberry Pi Zero 2 W (Quad-core ARM Cortex-A53 @ 1.0 GHz, 512 MB RAM)
+  - Vision Sensor: Luxonis OAK-D Lite (Sony IMX214 RGB + Dual OV9782 Stereo Depth)
+
+CLI Usage Examples:
+  # Default: Ingest from default video capture node (/dev/video0 or webcam)
   python main.py
 
-  # Custom source (video file or RTSP URL)
-  python main.py --source test_footage.mp4
-  python main.py --source rtsp://192.168.1.10/stream
+  # Ingest from flight test video recording or network RTSP stream
+  python main.py --source flight_test.mp4
+  python main.py --source rtsp://192.168.1.10:554/live
 
-  # Custom config
-  python main.py --config my_config.yaml
+  # Specify custom YAML configuration file
+  python main.py --config config.yaml
 
-  # Headless mode (no display window — for deployment on Pi 5)
+  # Production Headless Mode (Disables GUI windows for RPi Zero 2 W flight deployment)
   python main.py --no-debug
 
-  # Emit JSON detections to stdout (for future mapping module)
+  # Stream serial JSON detection records to standard output for downstream SLAM/mapping
   python main.py --json
 
-  # Write JSON to file
+  # Record serial JSON detection records to a newline-delimited JSONL file
   python main.py --json --json-out detections.jsonl
 
-Keyboard shortcuts (debug window):
-  q / Escape  — quit
-  p           — pause / resume
-  s           — save current frame as PNG
+Interactive GUI Controls (Active in Debug Mode):
+  q / Escape : Terminate detection loop and release hardware resources
+  p          : Toggle live stream pause/resume state
+  s          : Capture and save current annotated frame as PNG in saved_frames/
 
 Author: Robofest 6.0 — Landmine Detection Team
 """
@@ -44,47 +54,74 @@ import os
 import sys
 import time
 from pathlib import Path
+from typing import Optional, TextIO
 
 import cv2
 import numpy as np
 import yaml
 
-# ---------------------------------------------------------------------------
-# Ensure the project root is on sys.path regardless of working directory
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# System Path Initialization
+# ===========================================================================
+# Ensure the repository root directory is present in sys.path
 PROJECT_ROOT = Path(__file__).resolve().parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-# ---------------------------------------------------------------------------
-# Module imports (after sys.path patch)
-# ---------------------------------------------------------------------------
-from capture.camera_source import build_source
-from detection import build_detector
+# ===========================================================================
+# Subsystem Module Imports
+# ===========================================================================
+from capture.camera_source import CameraSource, build_source
+from detection import Detector, build_detector
 from output.detection_result import FrameResult
-from preprocess.frame_prep import FramePreprocessor
+from preprocess.frame_prep import FramePreprocessor, LetterboxInfo
 from visualization.debug_overlay import DebugOverlay
 
 
-# ---------------------------------------------------------------------------
-# Logging setup
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# Logging Infrastructure
+# ===========================================================================
 
 def _setup_logging(verbose: bool = False) -> None:
+    """
+    Initialize system-wide console logging format and severity filter.
+
+    Parameters
+    ----------
+    verbose : bool, default=False
+        If True, sets root logging level to DEBUG. Otherwise defaults to INFO.
+    """
     level = logging.DEBUG if verbose else logging.INFO
     logging.basicConfig(
-        level  = level,
-        format = "%(asctime)s  %(levelname)-7s  %(name)s — %(message)s",
+        level   = level,
+        format  = "%(asctime)s  %(levelname)-7s  %(name)s — %(message)s",
         datefmt = "%H:%M:%S",
     )
 
 
-# ---------------------------------------------------------------------------
-# Config loader
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# Configuration Loader
+# ===========================================================================
 
 def load_config(path: str | Path) -> dict:
-    """Load and return the YAML config as a plain dict."""
+    """
+    Parse and validate YAML configuration file from the filesystem.
+
+    Parameters
+    ----------
+    path : str or Path
+        Filesystem path to the target YAML configuration file.
+
+    Returns
+    -------
+    dict
+        Parsed configuration parameter registry dictionary.
+
+    Raises
+    ------
+    FileNotFoundError
+        If the target configuration path does not exist on disk.
+    """
     config_path = Path(path)
     if not config_path.exists():
         raise FileNotFoundError(
@@ -93,68 +130,83 @@ def load_config(path: str | Path) -> dict:
         )
     with open(config_path, "r", encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
-    logging.getLogger(__name__).info("Loaded config: %s", config_path.resolve())
+    logging.getLogger(__name__).info("Loaded configuration: %s", config_path.resolve())
     return cfg
 
 
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# Command-Line Argument Parser
+# ===========================================================================
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(
-        description="Landmine Detection Module — Robofest Gujarat 6.0",
+    """
+    Construct command-line interface arguments and help documentation.
+
+    Returns
+    -------
+    argparse.Namespace
+        Parsed command-line arguments namespace.
+    """
+    parser = argparse.ArgumentParser(
+        description="Landmine & Subsurface Marker Detection Engine — Robofest Gujarat 6.0",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
-    p.add_argument(
+    parser.add_argument(
         "--source", default=None,
         help=(
-            "Camera source override. "
-            "Integer = webcam index, string = file path or rtsp:// URL. "
-            "Overrides config.yaml camera.source if provided."
+            "Camera source override: Integer device index (e.g., 0 for /dev/video0), "
+            "video file path, or rtsp:// URL. Overrides config.yaml camera.source."
         ),
     )
-    p.add_argument(
+    parser.add_argument(
         "--config", default="config.yaml",
-        help="Path to config YAML file (default: config.yaml in current directory).",
+        help="Path to YAML configuration file (default: config.yaml).",
     )
-    p.add_argument(
+    parser.add_argument(
         "--no-debug", action="store_true",
-        help="Disable debug visualization window (headless mode).",
+        help="Disable OpenCV GUI visualization window (mandatory for headless drone deployment).",
     )
-    p.add_argument(
+    parser.add_argument(
         "--json", action="store_true",
-        help="Emit JSON detection results to stdout (one line per frame).",
+        help="Stream JSON FrameResult records to standard output (one JSON line per frame).",
     )
-    p.add_argument(
+    parser.add_argument(
         "--json-out", default=None, metavar="FILE",
-        help="Write JSON detection results to a JSONL file.",
+        help="Append JSON detection records to a designated JSONL output file.",
     )
-    p.add_argument(
+    parser.add_argument(
         "--verbose", "-v", action="store_true",
-        help="Enable verbose DEBUG logging.",
+        help="Activate verbose DEBUG-level logging.",
     )
-    p.add_argument(
+    parser.add_argument(
         "--max-frames", type=int, default=0,
-        help="Stop after N frames (0 = run indefinitely). Useful for batch testing.",
+        help="Terminate execution after processing N frames (0 = run indefinitely).",
     )
-    return p.parse_args()
+    return parser.parse_args()
 
 
-# ---------------------------------------------------------------------------
-# Main loop
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# Main Execution Loop
+# ===========================================================================
 
 def run(args: argparse.Namespace) -> None:
+    """
+    Initialize all vision modules and execute the real-time perception event loop.
+
+    Parameters
+    ----------
+    args : argparse.Namespace
+        Parsed CLI arguments from parse_args().
+    """
     logger = logging.getLogger("main")
 
-    # --- Load config ---
+    # -----------------------------------------------------------------------
+    # 1. Configuration Ingestion & CLI Overrides
+    # -----------------------------------------------------------------------
     cfg = load_config(args.config)
 
-    # --- CLI overrides ---
     if args.source is not None:
-        # Try to convert to int (webcam index) if possible
         try:
             cfg["camera"]["source"] = int(args.source)
         except ValueError:
@@ -169,62 +221,68 @@ def run(args: argparse.Namespace) -> None:
     if args.json_out:
         cfg.setdefault("output", {})["json_output_file"] = args.json_out
 
-    # --- Build components ---
-    logger.info("Initializing modules...")
-    source      = build_source(cfg["camera"])
-    preprocessor = FramePreprocessor(cfg["camera"], cfg.get("preprocessing", {}))
-    detector    = build_detector(cfg)
-    overlay     = DebugOverlay(cfg.get("debug", {}))
+    # -----------------------------------------------------------------------
+    # 2. Pipeline Subsystem Construction
+    # -----------------------------------------------------------------------
+    logger.info("Initializing perception subsystems...")
+    source: CameraSource = build_source(cfg["camera"])
+    preprocessor: FramePreprocessor = FramePreprocessor(cfg["camera"], cfg.get("preprocessing", {}))
+    detector: Detector = build_detector(cfg)
+    overlay: DebugOverlay = DebugOverlay(cfg.get("debug", {}))
 
-    # --- JSON output file handle ---
-    json_file = None
-    json_path = cfg.get("output", {}).get("json_output_file", "")
-    emit_json = cfg.get("output", {}).get("emit_json", False)
+    # -----------------------------------------------------------------------
+    # 3. File Descriptors & Output Stream Setup
+    # -----------------------------------------------------------------------
+    json_file: Optional[TextIO] = None
+    json_path: str = cfg.get("output", {}).get("json_output_file", "")
+    emit_json: bool = bool(cfg.get("output", {}).get("emit_json", False))
+
     if json_path:
         json_file = open(json_path, "w", encoding="utf-8")
-        logger.info("JSON output → %s", json_path)
+        logger.info("Streaming JSON output to file: %s", json_path)
 
-    # --- Frame loop ---
-    logger.info("Starting detection loop. Press 'q' in window or Ctrl+C to stop.")
-    frame_id  = 0
-    paused    = False
-    saved     = 0
-    save_dir  = PROJECT_ROOT / "saved_frames"
+    # -----------------------------------------------------------------------
+    # 4. Perception Event Loop
+    # -----------------------------------------------------------------------
+    logger.info("Starting detection loop. Press 'q' or Ctrl+C to terminate.")
+    frame_id: int = 0
+    paused: bool = False
+    saved: int = 0
+    save_dir: Path = PROJECT_ROOT / "saved_frames"
 
     try:
         while True:
-            # Pause / resume via 'p' key (handled in overlay.show return value)
+            # Handle interactive pause state
             if paused:
                 time.sleep(0.05)
-                # Still need to poll for keypress to un-pause
                 key = cv2.waitKey(50) & 0xFF
                 if key == ord("p"):
                     paused = False
-                    logger.info("Resumed.")
+                    logger.info("Perception loop resumed.")
                 elif key in (ord("q"), 27):
                     break
                 continue
 
-            # --- Capture ---
-            t_capture = time.monotonic()
-            timestamp_ms = time.time() * 1000.0
+            # Stage A: Frame Acquisition & Timestamping
+            t_capture: float = time.monotonic()
+            timestamp_ms: float = time.time() * 1000.0
             frame = source.read()
             if frame is None:
-                logger.info("Source exhausted — stopping.")
+                logger.info("Input stream exhausted or disconnected. Terminating loop.")
                 break
 
-            # --- Preprocess ---
+            # Stage B: Photometric Conditioning & Letterboxing
             processed, lb_info = preprocessor.process(frame)
 
-            # --- Detect ---
-            t_detect = time.monotonic()
+            # Stage C: Detection & Spatial Extraction
+            t_detect: float = time.monotonic()
             detections = detector.detect(processed, frame_id, timestamp_ms)
-            t_done = time.monotonic()
+            t_done: float = time.monotonic()
 
-            processing_ms = (t_done - t_capture) * 1000.0
-            detect_ms     = (t_done - t_detect) * 1000.0
+            processing_ms: float = (t_done - t_capture) * 1000.0
+            detect_ms: float = (t_done - t_detect) * 1000.0
 
-            # --- Assemble FrameResult ---
+            # Stage D: Data Contract Assembly
             result = FrameResult(
                 frame_id           = frame_id,
                 timestamp_ms       = timestamp_ms,
@@ -235,7 +293,7 @@ def run(args: argparse.Namespace) -> None:
                 processing_time_ms = processing_ms,
             )
 
-            # --- JSON output ---
+            # Stage E: Serial Output & IPC Streaming
             if emit_json:
                 line = json.dumps(result.to_dict())
                 print(line, flush=True)
@@ -243,68 +301,65 @@ def run(args: argparse.Namespace) -> None:
                 json_file.write(json.dumps(result.to_dict()) + "\n")
                 json_file.flush()
 
-            # --- Debug log (only when detections present) ---
+            # Stage F: Telemetry Logging
             if detections:
                 logger.debug(
-                    "Frame %d: %d detection(s) in %.1f ms — %s",
+                    "Frame %d: %d target(s) detected in %.1f ms (detect: %.1f ms) — %s",
                     frame_id,
                     len(detections),
+                    processing_ms,
                     detect_ms,
                     [(d.class_name, round(d.confidence, 2)) for d in detections],
                 )
 
-            # --- Visualization ---
+            # Stage G: Diagnostic HUD Visualization
             annotated = overlay.render(processed, result, detector.backend_name)
-
-            # Handle key events from the overlay window
             should_continue = overlay.show(annotated)
             if not should_continue:
-                logger.info("User quit (q/Escape).")
+                logger.info("User requested termination (q/Escape).")
                 break
 
-            # Additional key handling via a secondary waitKey (already consumed above,
-            # but we check a global key state via the overlay)
-            # 'p' = pause, 's' = save frame
-            # (These are detected via cv2.waitKey inside overlay.show)
-            # We poll separately here for save / pause since overlay only checks q/Esc:
+            # Stage H: Interactive Key Event Dispatch
             key = cv2.waitKey(1) & 0xFF
             if key == ord("p"):
                 paused = True
-                logger.info("Paused. Press 'p' in window to resume.")
+                logger.info("Perception loop paused. Press 'p' in window to resume.")
             elif key == ord("s"):
                 save_dir.mkdir(exist_ok=True)
-                fname = save_dir / f"frame_{frame_id:06d}.png"
-                cv2.imwrite(str(fname), annotated)
+                snapshot_path = save_dir / f"frame_{frame_id:06d}.png"
+                cv2.imwrite(str(snapshot_path), annotated)
                 saved += 1
-                logger.info("Saved frame: %s", fname)
+                logger.info("Diagnostic snapshot exported: %s", snapshot_path)
 
             frame_id += 1
 
-            # Max frames gate
+            # Frame budget gate
             if args.max_frames > 0 and frame_id >= args.max_frames:
-                logger.info("Reached max_frames=%d — stopping.", args.max_frames)
+                logger.info("Processed maximum frame budget (max_frames=%d). Exiting.", args.max_frames)
                 break
 
     except KeyboardInterrupt:
-        logger.info("Interrupted by user (Ctrl+C).")
+        logger.info("Execution interrupted by user (Ctrl+C).")
 
     finally:
-        # --- Cleanup ---
+        # -------------------------------------------------------------------
+        # 5. Hardware Teardown & Resource Cleanup
+        # -------------------------------------------------------------------
         source.release()
         overlay.close()
         if json_file:
             json_file.close()
         logger.info(
-            "Session complete. Processed %d frames. Saved %d snapshots.",
+            "Session terminated. Processed %d frames. Exported %d diagnostic snapshots.",
             frame_id, saved,
         )
 
 
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# Execution Entry Point
+# ===========================================================================
 
 if __name__ == "__main__":
-    args = parse_args()
-    _setup_logging(args.verbose)
-    run(args)
+    cli_args = parse_args()
+    _setup_logging(cli_args.verbose)
+    run(cli_args)
