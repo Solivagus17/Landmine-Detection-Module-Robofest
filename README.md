@@ -379,9 +379,3 @@ python test_integration.py
 Senior Division · Aerial Robotics · Minefield Navigation
 
 ---
-
-<div align="center">
-
-*Built with ❤️ for Robofest Gujarat 6.0*
-
-</div>
