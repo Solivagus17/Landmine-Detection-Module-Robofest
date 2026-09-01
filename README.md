@@ -345,13 +345,12 @@ $$\mathbf{I}_{\text{canvas}}(x, y) = \begin{cases}
 \end{cases}$$
 
 #### 2. Luminance-Isolated CLAHE
-Standard histogram equalization in RGB space causes severe chromatic distortion. The pipeline transforms the image to CIE $L^*a^*b^*$ and equalizes only the luminance component $L^* \in [0, 255]$:
+Standard histogram equalization in RGB space causes severe chromatic distortion. The pipeline transforms the image to CIE $L^{*}a^{*}b^{*}$ and equalizes only the luminance component $L^{*} \in [0, 255]$:
 
-$$L^*_{\text{eq}}(x, y) = \text{CLAHE}\Big( L^*(x, y) \;\Big|\; \text{clipLimit} = 2.0, \; \text{grid} = 8 \times 8 \Big)$$
+$$L^{*}_{\text{eq}}(x, y) = \text{CLAHE}\Big( L^{*}(x, y) \;\Big|\; \text{clipLimit} = 2.0, \; \text{grid} = 8 \times 8 \Big)$$
 
-$$\mathbf{I}_{\text{enhanced}} = \mathcal{T}_{\text{LAB}\rightarrow\text{BGR}}\Big( \big[ L^*_{\text{eq}}, a^*, b^* \big] \Big)$$
+$$\mathbf{I}_{\text{enhanced}} = \mathcal{T}_{\text{LAB}\rightarrow\text{BGR}}\Big( \big[ L^{*}_{\text{eq}}, a^{*}, b^{*} \big] \Big)$$
 
----
 
 ### Phase 2: Dual-Stream Candidate Proposal & IoU Deduplication
 
