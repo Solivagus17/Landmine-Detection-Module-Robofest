@@ -347,9 +347,10 @@ $$\mathbf{I}_{\text{canvas}}(x, y) = \begin{cases}
 #### 2. Luminance-Isolated CLAHE
 Standard histogram equalization in RGB space causes severe chromatic distortion. The pipeline transforms the image to CIE $L^{\ast}a^{\ast}b^{\ast}$ and equalizes only the luminance component $L^{\ast} \in [0, 255]$:
 
-$$L^{\ast}_{\text{eq}}(x, y) = \text{CLAHE}\Big( L^{\ast}(x, y) \;\Big|\; \text{clipLimit} = 2.0, \; \text{grid} = 8 \times 8 \Big)$$
+$$L^{\ast}_{\text{eq}}(x, y) = \text{CLAHE}_{\,\alpha=2.0,\; \mathbf{g}=8\times 8}\!\left( L^{\ast}(x, y) \right)$$
 
-$$\mathbf{I}_{\text{enhanced}} = \mathcal{T}_{\text{LAB}\rightarrow\text{BGR}}\Big( \big[ L^{\ast}_{\text{eq}}, a^{\ast}, b^{\ast} \big] \Big)$$
+$$\mathbf{I}_{\text{enhanced}} = \mathcal{T}_{\text{LAB}\rightarrow\text{BGR}}\Big( \big[ L^{\ast}_{\text{eq}},\; a^{\ast},\; b^{\ast} \big] \Big)$$
+
 
 
 
